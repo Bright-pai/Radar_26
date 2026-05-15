@@ -1,0 +1,54 @@
+%YAML:1.0
+team: "R"
+debug: 0
+debug_request_key_update: 0
+debug_request_enemy_key: 0
+show_ui: 1
+opencv_threads: 0           # 0 uses default, otherwise fixed OpenCV thread count
+guess_switch_interval_sec: 1000
+
+camera:
+  mode: "video_file"            # daheng | video_file | test
+  video_path: "../images/7.27-华东理工.mp4"
+  snapshot_path: "../camera_test_snapshot.jpg"
+  device_id: 0
+  daheng_device_index: 1         # 1-based index used when mode=daheng
+  width: 1920
+  height: 1080
+  exposure_time: 8000.0         # us, primarily for daheng mode
+  gain: 4.0                     # analog gain, primarily for daheng mode
+  daheng_auto_white_balance: 1   # 1: Continuous, 0: Off
+  daheng_flip_vertical: 0        # flip output image vertically
+
+serial:
+  enable: 1                   # enable serial communication with main controller
+  port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+  baudrate: 115200
+  send_period_ms: 100
+
+model:
+  car_engine: "../models/car_trt10.engine"
+  armor_engine: "../models/armor_trt10_dyn_b4.engine"
+  input_width: 640
+  input_height: 640
+  car_class_names: [ "car", "armor", "ignore", "watcher", "base" ]
+  armor_class_names: [ "B1", "B2", "B3", "B4", "B5", "B7", "R1", "R2", "R3", "R4", "R5", "R7" ]
+
+detection:
+  car_conf: 0.50
+  car_iou: 0.50
+  car_max_det: 12
+  armor_conf: 0.50
+  armor_iou: 0.20
+  armor_max_det: 12
+  filter_timeout_sec: 2.0
+
+calibration:
+  red_path: "calibration_red.yaml"
+  blue_path: "calibration_blue.yaml"
+  map_image: "../images/map.jpg"
+  red_mask_image: "../images/map_red_s_mask.jpg"
+  blue_mask_image: "../images/map_blue_stest_mask.jpg"
+
+log:
+  referee_path: "../logs/referee_system.log"

@@ -1,4 +1,4 @@
-# Radar_26 — 使用说明（精简版，已同步）
+# Radar_26 — 使用说明
 
 该仓库包含 Radar_26 C++ 主程序（CMake + OpenCV + TensorRT）。本 README 已同步到当前代码实现：串口接收处理为 `0x020E` 与 `0x0301`，忽略 `0x020B`。
 

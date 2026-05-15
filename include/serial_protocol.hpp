@@ -66,8 +66,8 @@ std::vector<uint8_t> BuildGeneralPacket(uint8_t seq, uint16_t cmdId, const std::
 bool BuildPositionPacket(uint8_t seq, const std::vector<uint16_t>& coords, std::vector<uint8_t>* packet,
                          std::string* error);
 
-bool BuildRadarCmdPacket(uint8_t seq, uint8_t radarCmd, uint8_t passwordCmd, const std::array<uint8_t, 6>& key,
-                         std::vector<uint8_t>* packet, std::string* error);
+bool BuildRadarCmdPacket(uint8_t seq, uint16_t senderId, uint8_t radarCmd, uint8_t passwordCmd,
+                         const std::array<uint8_t, 6>& key, std::vector<uint8_t>* packet, std::string* error);
 
 bool BuildRadarCustomData0301Packet(uint8_t seq, uint16_t senderId, uint16_t receiverId,
                                     std::vector<uint8_t>* packet, std::string* error);

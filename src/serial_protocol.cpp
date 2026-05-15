@@ -166,15 +166,24 @@ bool BuildPositionPacket(uint8_t seq, const std::vector<uint16_t>& coords, std::
     return true;
 }
 
-bool BuildRadarCmdPacket(uint8_t seq, uint8_t radarCmd, uint8_t passwordCmd, const std::array<uint8_t, 6>& key,
-                         std::vector<uint8_t>* packet, std::string* error) {
-    (void)error;
+bool BuildRadarCmdPacket(uint8_t seq, uint16_t senderId, uint8_t radarCmd, uint8_t passwordCmd,
+                         const std::array<uint8_t, 6>& key, std::vector<uint8_t>* packet, std::string* error) {
+    if (packet == nullptr) {
+        if (error != nullptr) *error = "packet output is null";
+        return false;
+    }
+
+    // data: sub_id(0x0121) + sender_id + receiver(0x8080) + radar_cmd + password_cmd + key
     std::vector<uint8_t> data;
-    data.reserve(8);
+    data.reserve(14);
+    AppendU16(&data, 0x0121);        // sub_id
+    AppendU16(&data, senderId);      // 红方=9, 蓝方=109
+    AppendU16(&data, 0x8080);        // receiver_id 固定
     data.push_back(radarCmd);
     data.push_back(passwordCmd);
     data.insert(data.end(), key.begin(), key.end());
-    *packet = BuildGeneralPacket(seq, 0x0121, data);
+
+    *packet = BuildGeneralPacket(seq, 0x0301, data);
     return true;
 }
 

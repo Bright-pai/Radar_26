@@ -396,10 +396,13 @@ void RadarApp::SerialSendLoop() {
             if (shouldSendNow) {
                 std::vector<uint8_t> cmdPacket;
                 const uint8_t radarCmdToSend = chanceCounter_;
-                if (BuildRadarCmdPacket(seq, radarCmdToSend, plan.passwordCmd, currentKey_, &cmdPacket, &error)) {
+                const uint16_t senderId = (config_.team == Team::Red) ? 9 : 109;
+                if (BuildRadarCmdPacket(seq, senderId, radarCmdToSend, plan.passwordCmd, currentKey_, &cmdPacket, &error)) {
                     if (serial_->Write(cmdPacket, &error)) {
                             {
-                                std::string sentText = HexDump(cmdPacket) + " | " + BuildRadarCmdStatus(radarCmdToSend, plan.passwordCmd, currentKey_);
+                                std::string sentText = HexDump(cmdPacket) + " | cmd=0x0301 sub=0x0121 sender="
+                                                     + std::to_string(senderId) + " receiver=0x8080 | "
+                                                     + BuildRadarCmdStatus(radarCmdToSend, plan.passwordCmd, currentKey_);
                                 UpdateSerialStatus(&tx0121_, seq, sentText);
                             }
                         if (immediateDoubleTrigger) handledDoubleEpoch = observedDoubleEpoch;

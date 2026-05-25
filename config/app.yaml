@@ -1,6 +1,6 @@
 %YAML:1.0
 team: "R"
-debug: 0
+debug: 1
 debug_request_key_update: 0
 debug_request_enemy_key: 0
 show_ui: 1
@@ -25,6 +25,11 @@ serial:
   port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
   baudrate: 115200
   send_period_ms: 100
+
+tcp:
+  enable: 1                   # enable TCP trigger signal output
+  ip: "192.168.12.2"             # 改成目标服务器 IP
+  port: 5000                  # 改成目标服务器端口
 
 model:
   car_engine: "../models/car_trt10.engine"

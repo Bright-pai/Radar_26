@@ -1,7 +1,36 @@
-// crc8 generator polynomial:G(x)=x8+x5+x4+1
+/**
+ * @file CRC.cpp
+ * @brief CRC8/CRC16 校验工具实现
+ *
+ * 本文件实现了与裁判系统协议兼容的 CRC8 和 CRC16 校验算法。
+ * 提供三种操作：计算校验值、验证校验值、将校验值附加到数据末尾。
+ *
+ * CRC8 算法特点：
+ *   - 多项式: 0x1D (x^8 + x^4 + x^3 + x^2 + 1)，使用查表法加速
+ *   - 初始值: 0xFF
+ *   - 不需要异或输出值
+ *   - 校验位置: 数据帧的最后一个字节
+ *
+ * CRC16 算法特点（CRC-16/XMODEM 变体）：
+ *   - 多项式: 0x1021 (x^16 + x^12 + x^5 + 1)，使用查表法加速
+ *   - 初始值: 0xFFFF
+ *   - 不需要异或输出值
+ *   - 校验位置: 数据帧的最后两个字节（低字节在前，高字节在后）
+ *   - 输入和输出均不进行字节反转
+ *
+ * 使用示例：
+ *   发送方：Append_CRC16_Check_Sum(buffer, length);  // 将 CRC16 填入帧尾
+ *   接收方：Verify_CRC16_Check_Sum(buffer, length);  // 验证整帧 CRC16 是否正确
+ */
+
 #include "iostream"
 #include "stdint.h"
 
+// ============================================================================
+// CRC16 查表法查找表（256 个条目）
+// 多项式: 0x1021, 初始值: 0xFFFF, 不反转输入/输出
+// 该表由 CRC-16/XMODEM 算法预计算生成，避免运行时重复计算多项式除法
+// ============================================================================
 const uint16_t wCRC_Table[256] = {
     0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48,
     0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7, 0x1081, 0x0108,
@@ -33,6 +62,11 @@ const uint16_t wCRC_Table[256] = {
     0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330, 0x7bc7, 0x6a4e, 0x58d5, 0x495c,
     0x3de3, 0x2c6a, 0x1ef1, 0x0f78};
 
+// ============================================================================
+// CRC8 查表法查找表（256 个条目）
+// 多项式: 0x1D (x^8 + x^4 + x^3 + x^2 + 1), 初始值: 0xFF
+// 该表由 CRC-8/MAXIM 算法预计算生成，每个字节的 CRC 结果直接从表中索引
+// ============================================================================
 const unsigned char CRC8_TAB[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20,
     0xa3, 0xfd, 0x1f, 0x41, 0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e,
@@ -57,56 +91,113 @@ const unsigned char CRC8_TAB[256] = {
     0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7, 0xb6, 0xe8, 0x0a, 0x54,
     0xd7, 0x89, 0x6b, 0x35,
 };
+
+// CRC8 校验初始值，与裁判系统协议保持一致
 const unsigned char CRC8_INIT = 0xff;
 
+/**
+ * @brief 计算 CRC8 校验值（逐字节迭代）
+ *
+ * 使用查表法对指定长度的数据计算 CRC8 校验值。
+ * CRC8 多项式: 0x1D, 初始值由调用者通过 ucCRC8 参数传入（通常为 CRC8_INIT = 0xFF）。
+ * 每处理一个字节：用当前 CRC 值与该字节异或得到查表索引，再从 CRC8_TAB 中取出新 CRC 值。
+ *
+ * @param pchMessage 指向待计算数据的指针（输入数据缓冲区首地址）
+ * @param dwLength   待计算数据的字节长度
+ * @param ucCRC8     CRC8 初始值（通常传入 CRC8_INIT，即 0xFF）
+ * @return unsigned char 计算得到的 8 位 CRC 校验值
+ */
 unsigned char Get_CRC8_Check_Sum(unsigned char *pchMessage,
                                  unsigned int dwLength, unsigned char ucCRC8) {
   unsigned char ucIndex;
+  // 逐字节处理：当前 CRC 与数据字节异或后查表，得到新的 CRC 值
   while (dwLength--) {
     ucIndex = ucCRC8 ^ (*pchMessage++);
     ucCRC8 = CRC8_TAB[ucIndex];
   }
   return (ucCRC8);
 }
-/*
-** Descriptions: CRC8 Verify function
-** Input: Data to Verify,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
+
+/**
+ * @brief 验证整帧数据的 CRC8 校验值是否正确
+ *
+ * 对包含 CRC8 校验字节的完整数据帧进行验证。
+ * 约定数据帧的最后一个字节为 CRC8 校验值，前 (dwLength-1) 个字节为有效数据。
+ * 函数将重新计算有效数据的 CRC8 校验值，并与帧尾的校验字节进行比较。
+ *
+ * @param pchMessage 指向完整数据帧的指针（包含数据和末尾的 CRC8 校验字节）
+ * @param dwLength   整帧数据的字节长度（数据 + CRC8 校验字节）
+ * @return unsigned int 校验通过返回 1（校验值匹配），校验失败或参数无效返回 0
+ *
+ * 注意：
+ *   - pchMessage 为空指针时返回 0
+ *   - dwLength <= 2 时认为数据长度不足，返回 0
+ *   - 校验使用的初始值为 CRC8_INIT (0xFF)
+ */
 unsigned int Verify_CRC8_Check_Sum(unsigned char *pchMessage,
                                    unsigned int dwLength) {
   unsigned char ucExpected = 0;
+  // 参数有效性检查：空指针或长度不足以包含数据+校验字节
   if ((pchMessage == 0) || (dwLength <= 2))
     return 0;
+  // 对前 dwLength-1 字节计算 CRC8，得到期望的校验值
   ucExpected = Get_CRC8_Check_Sum(pchMessage, dwLength - 1, CRC8_INIT);
+  // 将计算出的校验值与帧尾实际存储的校验值比对
   return (ucExpected == pchMessage[dwLength - 1]);
 }
-/*
-** Descriptions: append CRC8 to the end of data
-** Input: Data to CRC and append,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
+
+/**
+ * @brief 将计算出的 CRC8 校验值附加到数据帧末尾
+ *
+ * 对前 (dwLength-1) 个字节计算 CRC8 校验值，并将结果写入数据帧的最后一个字节位置。
+ * 调用前需确保数据缓冲区已为 CRC8 校验字节预留了空间。
+ *
+ * @param pchMessage 指向数据缓冲区的指针（调用后最后一个字节将被 CRC8 校验值覆盖）
+ * @param dwLength   数据缓冲区的总字节长度（包含预留的 CRC8 字节位置）
+ *
+ * 注意：
+ *   - pchMessage 为空指针或 dwLength <= 2 时不执行任何操作
+ *   - CRC8 校验字节写入 pchMessage[dwLength - 1] 位置
+ *   - 校验使用的初始值为 CRC8_INIT (0xFF)
+ */
 void Append_CRC8_Check_Sum(unsigned char *pchMessage, unsigned int dwLength) {
   unsigned char ucCRC = 0;
+  // 参数有效性检查
   if ((pchMessage == 0) || (dwLength <= 2))
     return;
+  // 对前 dwLength-1 字节计算 CRC8
   ucCRC =
       Get_CRC8_Check_Sum((unsigned char *)pchMessage, dwLength - 1, CRC8_INIT);
+  // 将 CRC8 校验值填入帧尾
   pchMessage[dwLength - 1] = ucCRC;
 }
+
+// CRC16 校验初始值，与裁判系统协议保持一致
 uint16_t CRC_INIT = 0xffff;
 
-/*
-** Descriptions: CRC16 checksum function
-** Input: Data to check,Stream length, initialized checksum
-** Output: CRC checksum
-*/
+/**
+ * @brief 计算 CRC16 校验值（逐字节迭代）
+ *
+ * 使用查表法对指定长度的数据计算 CRC16 校验值。
+ * 算法：每处理一个字节，将当前 CRC 值的高 8 位右移后，与查表结果异或。
+ * 查表索引 = (当前 CRC 低 8 位) XOR (当前数据字节)。
+ *
+ * 这是 CRC-16/XMODEM 的标准实现方式，输入和输出均不进行字节反转。
+ *
+ * @param pchMessage 指向待计算数据的指针（输入数据缓冲区首地址）
+ * @param dwLength   待计算数据的字节长度
+ * @param wCRC       CRC16 初始值（通常传入 CRC_INIT，即 0xFFFF）
+ * @return uint16_t  计算得到的 16 位 CRC 校验值
+ *
+ * 注意：pchMessage 为 NULL 时直接返回 0xFFFF
+ */
 uint16_t Get_CRC16_Check_Sum(uint8_t *pchMessage, uint32_t dwLength,
                              uint16_t wCRC) {
   uint8_t chData;
   if (pchMessage == NULL) {
     return 0xFFFF;
   }
+  // 逐字节处理：右移当前 CRC 高 8 位，与查表结果异或
   while (dwLength--) {
     chData = *pchMessage++;
     (wCRC) = ((uint16_t)(wCRC) >> 8) ^
@@ -114,33 +205,62 @@ uint16_t Get_CRC16_Check_Sum(uint8_t *pchMessage, uint32_t dwLength,
   }
   return wCRC;
 }
-/*
-77 © 2026 大疆 版权所有
-** Descriptions: CRC16 Verify function
-** Input: Data to Verify,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
+
+/**
+ * @brief 验证整帧数据的 CRC16 校验值是否正确
+ *
+ * 对包含 CRC16 校验字节的完整数据帧进行验证。
+ * 约定数据帧的最后两个字节为 CRC16 校验值（低字节在前，高字节在后），
+ * 前 (dwLength-2) 个字节为有效数据。
+ * 函数将重新计算有效数据的 CRC16 校验值，并与帧尾的两个校验字节进行比较。
+ *
+ * @param pchMessage 指向完整数据帧的指针（包含数据和末尾的 CRC16 校验字节）
+ * @param dwLength   整帧数据的字节长度（数据 + 2 字节 CRC16 校验值）
+ * @return uint32_t  校验通过返回 1（校验值匹配），校验失败或参数无效返回 0
+ *
+ * 注意：
+ *   - pchMessage 为 NULL 时返回 0
+ *   - dwLength <= 2 时认为数据长度不足，返回 0
+ *   - 帧尾存储格式：低字节在 pchMessage[dwLength-2]，高字节在 pchMessage[dwLength-1]
+ *   - 校验使用的初始值为 CRC_INIT (0xFFFF)
+ */
 uint32_t Verify_CRC16_Check_Sum(uint8_t *pchMessage, uint32_t dwLength) {
   uint16_t wExpected = 0;
+  // 参数有效性检查
   if ((pchMessage == NULL) || (dwLength <= 2)) {
     return 0;
   }
+  // 对前 dwLength-2 字节重新计算 CRC16，得到期望的校验值
   wExpected = Get_CRC16_Check_Sum(pchMessage, dwLength - 2, CRC_INIT);
+  // 比对低字节和高字节：帧尾格式为 [CRC16低字节, CRC16高字节]
   return ((wExpected & 0xff) == pchMessage[dwLength - 2] &&
           ((wExpected >> 8) & 0xff) == pchMessage[dwLength - 1]);
 }
-/*
-** Descriptions: append CRC16 to the end of data
-** Input: Data to CRC and append,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
+
+/**
+ * @brief 将计算出的 CRC16 校验值附加到数据帧末尾
+ *
+ * 对前 (dwLength-2) 个字节计算 CRC16 校验值，并将 2 字节结果写入数据帧的最后两个字节位置。
+ * 写入格式为低字节在前（pchMessage[dwLength-2]），高字节在后（pchMessage[dwLength-1]）。
+ * 调用前需确保数据缓冲区已为 CRC16 校验字节预留了 2 字节空间。
+ *
+ * @param pchMessage 指向数据缓冲区的指针（调用后最后两个字节将被 CRC16 校验值覆盖）
+ * @param dwLength   数据缓冲区的总字节长度（包含预留的 2 字节 CRC16 位置）
+ *
+ * 注意：
+ *   - pchMessage 为 NULL 或 dwLength <= 2 时不执行任何操作
+ *   - 校验使用的初始值为 CRC_INIT (0xFFFF)
+ *   - CRC16 校验值以低字节在前（小端序）格式写入帧尾
+ */
 void Append_CRC16_Check_Sum(uint8_t *pchMessage, uint32_t dwLength) {
   uint16_t wCRC = 0;
+  // 参数有效性检查
   if ((pchMessage == NULL) || (dwLength <= 2)) {
     return;
   }
+  // 对前 dwLength-2 字节计算 CRC16
   wCRC = Get_CRC16_Check_Sum((uint8_t *)pchMessage, dwLength - 2, CRC_INIT);
-  pchMessage[dwLength - 2] = (uint8_t)(wCRC & 0x00ff);
-  pchMessage[dwLength - 1] = (uint8_t)((wCRC >> 8) & 0x00ff);
+  // 将 CRC16 校验值以低字节在前的格式填入帧尾
+  pchMessage[dwLength - 2] = (uint8_t)(wCRC & 0x00ff);       // 低字节
+  pchMessage[dwLength - 1] = (uint8_t)((wCRC >> 8) & 0x00ff); // 高字节
 }
-

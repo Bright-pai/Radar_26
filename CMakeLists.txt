@@ -11,7 +11,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(RADAR26_WITH_DAHENG "Enable Daheng GXIAPI support" OFF)
+option(RADAR26_WITH_DAHENG "Enable Daheng GXIAPI support" ON)
 
 set(TENSORRT_ROOT "/usr/local/TensorRT-10.8.0.43" CACHE PATH "TensorRT root path")
 set(DAHENG_SDK_ROOT "/usr" CACHE PATH "Daheng SDK root path")
@@ -63,6 +63,7 @@ add_executable(${PROJECT_NAME}
     src/serial_monitor.cpp
     src/serial_port.cpp
     src/serial_protocol.cpp
+    src/tcp_client.cpp
     src/tracker_filter.cpp
     src/trt_detector.cpp
 )

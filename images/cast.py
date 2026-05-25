@@ -59,8 +59,8 @@ def cut_first_four_minutes(input_path, output_path=None):
 
 if __name__ == "__main__":
     # 原视频路径（根据你的实际情况修改）
-    input_video = "/home/liu/Desktop/Radar_26/images/7.27-哈工深.mp4"
-
+    input_video = "/home/liu/Desktop/Radar_26/images/7.27-华东理工.mp4"
+    
     # 输出路径设为 None 会自动在原文件名后添加 _trimmed
     # 你也可以手动指定，例如：output_video = "/home/liu/Desktop/Radar_26/images/7.27-华东理工_cut.mp4"
     output_video = None

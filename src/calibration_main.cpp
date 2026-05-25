@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+// 标定工具入口：从相机或视频取图，选择地图与点位，最后导出 npy 和 yaml 标定结果。
 namespace {
 
 constexpr int kLayerCount = 3;

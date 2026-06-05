@@ -19,6 +19,7 @@ public:
 
     // 打开串口设备并配置为原始模式。
     bool Open(const std::string& device, int baudrate, std::string* error);
+
     // 关闭串口。
     void Close();
 

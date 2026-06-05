@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Radar_26 启动器
+Comment=一键配置并启动 Radar_26 雷达系统
+Exec=bash /home/liu/Desktop/start_radar.sh
+Path=/home/liu/Desktop/Radar_26
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Development;

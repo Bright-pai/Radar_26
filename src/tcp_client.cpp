@@ -200,7 +200,6 @@ bool TcpClient::Connect(const std::string& ip, int port, std::string* error) {
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     connected_ = true;
-    std::cout << "[TCP] connected to " << ip << ":" << port << std::endl;
     return true;
 }
 
@@ -344,6 +343,12 @@ ssize_t TcpClient::Read(uint8_t* buffer, std::size_t size, std::string* error) {
     do {
         n = recv(fd_, buffer, size, 0);
     } while (n < 0 && errno == EINTR);
+    if (n == 0) {
+        // 对端正常关闭连接（TCP FIN）
+        connected_ = false;
+        if (error) *error = "tcp connection closed by peer";
+        return -1;
+    }
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         if (errno == EPIPE || errno == ECONNRESET) {
             connected_ = false;

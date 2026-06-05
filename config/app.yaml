@@ -1,5 +1,5 @@
 %YAML:1.0
-team: "R"
+team: "B"
 debug: 1
 debug_request_key_update: 0
 debug_request_enemy_key: 0
@@ -8,28 +8,28 @@ opencv_threads: 0           # 0 uses default, otherwise fixed OpenCV thread coun
 guess_switch_interval_sec: 1000
 
 camera:
-  mode: "video_file"            # daheng | video_file | test
-  video_path: "../images/7.27-华东理工.mp4"
+  mode: "video_file"
+  video_path: "../images/1d60d7a7d958b3eaeb050724a4e36e0f.mp4"
   snapshot_path: "../camera_test_snapshot.jpg"
-  device_id: 0
-  daheng_device_index: 1         # 1-based index used when mode=daheng
+  device_id: 1
+  daheng_device_index: 1        # 1-based index used when mode=daheng
   width: 1920
   height: 1080
-  exposure_time: 8000.0         # us, primarily for daheng mode
-  gain: 4.0                     # analog gain, primarily for daheng mode
+  exposure_time: 0.0             # us, primarily for daheng mode
+  gain: 0.0                      # analog gain, primarily for daheng mode
   daheng_auto_white_balance: 1   # 1: Continuous, 0: Off
   daheng_flip_vertical: 0        # flip output image vertically
 
 serial:
-  enable: 1                   # enable serial communication with main controller
+  enable: 1                      # enable serial communication with main controller
   port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
   baudrate: 115200
   send_period_ms: 100
 
 tcp:
-  enable: 1                   # enable TCP trigger signal output
+  enable: 1                      # enable TCP trigger signal output
   ip: "192.168.12.2"             # 改成目标服务器 IP
-  port: 5000                  # 改成目标服务器端口
+  port: 5000                     # 改成目标服务器端口
 
 model:
   car_engine: "../models/car_trt10.engine"

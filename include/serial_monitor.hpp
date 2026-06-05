@@ -34,18 +34,18 @@ public:
                 const SerialStatus& rx0301,
                 const SerialStatus& rx0001,
                 const SerialStatus& rx0003,
+                const SerialStatus& rx0101,
                 const SerialStatus& tcp01,
                 const SerialStatus& tcpRx8001,
                 const SerialStatus& tcpRx8002,
-                const SerialStatus& tcpRx8003,
-                const SerialStatus& tcpRx8004);
+                const SerialStatus& tcpRx8003);
 
 private:
     static std::string GetText(const SerialStatus& s);
     std::vector<std::string> WrapLines(const std::string& text, int maxWidth);
 
     static constexpr int kWidth = 1280;
-    static constexpr int kMinHeight = 720;
+    static constexpr int kMinHeight = 800;
     static constexpr char kWindowName[] = "Serial Monitor";
 
     bool open_ = false;

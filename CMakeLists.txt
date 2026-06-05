@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
+
 project(Radar_26 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -6,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_BUILD_TYPE Debug)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -80,6 +82,12 @@ add_executable(${PROJECT_NAME}_camera_test
     src/daheng_camera.cpp
 )
 
+add_executable(${PROJECT_NAME}_camera_tuner
+    src/camera_tuner.cpp
+    src/config_loader.cpp
+    src/daheng_camera.cpp
+)
+
 target_include_directories(${PROJECT_NAME}
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -96,11 +104,18 @@ target_include_directories(${PROJECT_NAME}_camera_test
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+target_include_directories(${PROJECT_NAME}_camera_tuner
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 target_compile_definitions(${PROJECT_NAME} PRIVATE RADAR26_WITH_TENSORRT=1)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE ${OpenCV_LIBS} pthread CUDA::cudart ${TENSORRT_NVINFER})
 target_link_libraries(${PROJECT_NAME}_calibration PRIVATE ${OpenCV_LIBS})
 target_link_libraries(${PROJECT_NAME}_camera_test PRIVATE ${OpenCV_LIBS})
+target_link_libraries(${PROJECT_NAME}_camera_tuner PRIVATE ${OpenCV_LIBS})
+
 
 if(OPENCV_FREETYPE_LIB)
     target_link_libraries(${PROJECT_NAME}_calibration PRIVATE ${OPENCV_FREETYPE_LIB})
@@ -143,10 +158,12 @@ if(RADAR26_WITH_DAHENG)
     target_include_directories(${PROJECT_NAME} PRIVATE ${DAHENG_INCLUDE_DIR})
     target_include_directories(${PROJECT_NAME}_calibration PRIVATE ${DAHENG_INCLUDE_DIR})
     target_include_directories(${PROJECT_NAME}_camera_test PRIVATE ${DAHENG_INCLUDE_DIR})
+    target_include_directories(${PROJECT_NAME}_camera_tuner PRIVATE ${DAHENG_INCLUDE_DIR})
 
     target_link_libraries(${PROJECT_NAME} PRIVATE ${DAHENG_GXIAPI})
     target_link_libraries(${PROJECT_NAME}_calibration PRIVATE ${DAHENG_GXIAPI})
     target_link_libraries(${PROJECT_NAME}_camera_test PRIVATE ${DAHENG_GXIAPI})
+    target_link_libraries(${PROJECT_NAME}_camera_tuner PRIVATE ${DAHENG_GXIAPI})
 
     get_filename_component(DAHENG_LIB_DIR ${DAHENG_GXIAPI} DIRECTORY)
     set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY BUILD_RPATH ${DAHENG_LIB_DIR})
@@ -155,16 +172,20 @@ if(RADAR26_WITH_DAHENG)
     set_property(TARGET ${PROJECT_NAME}_calibration APPEND PROPERTY INSTALL_RPATH ${DAHENG_LIB_DIR})
     set_property(TARGET ${PROJECT_NAME}_camera_test APPEND PROPERTY BUILD_RPATH ${DAHENG_LIB_DIR})
     set_property(TARGET ${PROJECT_NAME}_camera_test APPEND PROPERTY INSTALL_RPATH ${DAHENG_LIB_DIR})
+    set_property(TARGET ${PROJECT_NAME}_camera_tuner APPEND PROPERTY BUILD_RPATH ${DAHENG_LIB_DIR})
+    set_property(TARGET ${PROJECT_NAME}_camera_tuner APPEND PROPERTY INSTALL_RPATH ${DAHENG_LIB_DIR})
 endif()
 
 if(RADAR26_WITH_DAHENG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE RADAR26_WITH_DAHENG=1)
     target_compile_definitions(${PROJECT_NAME}_calibration PRIVATE RADAR26_WITH_DAHENG=1)
     target_compile_definitions(${PROJECT_NAME}_camera_test PRIVATE RADAR26_WITH_DAHENG=1)
+    target_compile_definitions(${PROJECT_NAME}_camera_tuner PRIVATE RADAR26_WITH_DAHENG=1)
 else()
     target_compile_definitions(${PROJECT_NAME} PRIVATE RADAR26_WITH_DAHENG=0)
     target_compile_definitions(${PROJECT_NAME}_calibration PRIVATE RADAR26_WITH_DAHENG=0)
     target_compile_definitions(${PROJECT_NAME}_camera_test PRIVATE RADAR26_WITH_DAHENG=0)
+    target_compile_definitions(${PROJECT_NAME}_camera_tuner PRIVATE RADAR26_WITH_DAHENG=0)
 endif()
 
 
@@ -174,3 +195,5 @@ set_property(TARGET ${PROJECT_NAME}_calibration APPEND PROPERTY BUILD_RPATH /usr
 set_property(TARGET ${PROJECT_NAME}_calibration APPEND PROPERTY INSTALL_RPATH /usr/lib)
 set_property(TARGET ${PROJECT_NAME}_camera_test APPEND PROPERTY BUILD_RPATH /usr/lib)
 set_property(TARGET ${PROJECT_NAME}_camera_test APPEND PROPERTY INSTALL_RPATH /usr/lib)
+set_property(TARGET ${PROJECT_NAME}_camera_tuner APPEND PROPERTY BUILD_RPATH /usr/lib)
+set_property(TARGET ${PROJECT_NAME}_camera_tuner APPEND PROPERTY INSTALL_RPATH /usr/lib)

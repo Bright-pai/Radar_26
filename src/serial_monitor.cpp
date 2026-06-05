@@ -75,97 +75,86 @@ void SerialMonitor::Update(const SerialStatus& tx0305,
                            const SerialStatus& rx0301,
                            const SerialStatus& rx0001,
                            const SerialStatus& rx0003,
+                           const SerialStatus& rx0101,
                            const SerialStatus& tcp01,
                            const SerialStatus& tcpRx8001,
                            const SerialStatus& tcpRx8002,
-                           const SerialStatus& tcpRx8003,
-                           const SerialStatus& tcpRx8004) {
+                           const SerialStatus& tcpRx8003) {
     if (!open_) return;
 
-    // ---- 绘制参数 ----
-    const int font = cv::FONT_HERSHEY_SIMPLEX;   // OpenCV 内置字体
-    const double scale = 0.45;                    // 字体缩放比例，控制文字大小
-    const int thickness = 1;                      // 文字线条粗细
-    const cv::Scalar bgColor(30, 30, 30);         // 深灰色背景，保护眼睛
-    const int lineHeight = 20;                    // 每行文字的高度(像素)
-    const int margin = 10;                        // 画布四周边距
-    const int maxTextWidth = kWidth - margin * 2; // 文字区域最大宽度
+    const int font = cv::FONT_HERSHEY_SIMPLEX;
+    const double scale = 0.40;
+    const double hdrScale = 0.50;
+    const int thickness = 1;
+    const cv::Scalar bgColor(25, 25, 30);
+    const int lineH = 18;
+    const int margin = 8;
+    const int maxTextWidth = kWidth - margin * 2;
 
-    // ---- 估算所需画布高度 ----
-    // 遍历所有9个通道，计算每个通道需要的行数(标题2行 + 内容行)
-    int totalLines = 0;
-    for (const auto* status : {&tx0305, &tx0121, &tx0301, &rx020E, &rx0301, &rx0001, &rx0003, &tcp01,
-                               &tcpRx8001, &tcpRx8002, &tcpRx8003, &tcpRx8004}) {
-        totalLines += 2; // 每个通道的标题栏占2行
-        std::string text = GetText(*status);
-        if (!text.empty()) {
-            auto wrapped = WrapLines(text, maxTextWidth);
-            totalLines += static_cast<int>(wrapped.size());
-        }
+    int totalLines = 5; // section headers
+    for (const auto* status : {&tx0305, &tx0121, &tx0301, &rx020E, &rx0301, &rx0001, &rx0003, &rx0101, &tcp01,
+                               &tcpRx8001, &tcpRx8002, &tcpRx8003}) {
+        totalLines += 1;
+        std::string t = GetText(*status);
+        if (!t.empty()) totalLines += static_cast<int>(WrapLines(t, maxTextWidth).size());
     }
-    totalLines += 5; // 通道之间的额外间距
 
-    // 画布高度取计算值与最小高度中的较大者
-    const int canvasHeight = std::max(kMinHeight, margin * 2 + totalLines * lineHeight);
-    // 创建 3 通道 8 位无符号彩色图像作为画布，初始化为深灰背景色
-    cv::Mat canvas(canvasHeight, kWidth, CV_8UC3, bgColor);
+    const int canvasH = std::max(800, margin * 2 + totalLines * lineH);
+    cv::Mat canvas(canvasH, kWidth, CV_8UC3, bgColor);
+    int y = margin;
 
-    int y = margin; // 当前绘制 Y 坐标，从上到下递增
-
-    // ---- 内部绘制辅助 Lambda ----
-
-    // drawLine: 在当前位置绘制单行文字，然后向下移动一行
     auto drawLine = [&](const std::string& text, const cv::Scalar& color) {
         cv::putText(canvas, text, cv::Point(margin, y), font, scale, color, thickness);
-        y += lineHeight;
+        y += lineH;
     };
-
-    // drawHeader: 绘制通道标题栏，格式为 "=== 通道名 ===  count=收发次数  lastSeq=最后序号 ==="
-    // 标题栏使用稍大的字体和粗线，以便和内容区分
-    auto drawHeader = [&](const std::string& label, const cv::Scalar& color,
-                          const SerialStatus& status) {
+    auto drawHdr = [&](const std::string& text, const cv::Scalar& color) {
+        cv::putText(canvas, text, cv::Point(margin, y), font, hdrScale, color, thickness + 1);
+        y += lineH + 4;
+    };
+    auto drawSec = [&](const std::string& text) {
+        y += 6;
+        cv::line(canvas, cv::Point(margin, y), cv::Point(kWidth - margin, y), cv::Scalar(100, 100, 100), 1);
+        y += 4;
+        cv::putText(canvas, text, cv::Point(margin, y), font, hdrScale, cv::Scalar(200, 200, 255), thickness + 1);
+        y += lineH + 4;
+    };
+    auto drawCh = [&](const std::string& id, const std::string& desc, const cv::Scalar& color,
+                      const SerialStatus& st) {
         std::ostringstream oss;
-        oss << "=== " << label << " ===  count=" << status.count.load(std::memory_order_relaxed)
-            << "  lastSeq=" << status.lastSeq.load(std::memory_order_relaxed) << " ===";
-        cv::putText(canvas, oss.str(), cv::Point(margin, y), font, scale + 0.05, color, thickness + 1);
-        y += lineHeight + 2;
+        oss << id << " " << desc << " | cnt=" << st.count.load(std::memory_order_relaxed);
+        cv::putText(canvas, oss.str(), cv::Point(margin, y), font, scale, color, thickness + 1);
+        y += lineH;
+        std::string txt = GetText(st);
+        if (txt.empty()) txt = "---";
+        for (const auto& line : WrapLines(txt, maxTextWidth))
+            drawLine(line, cv::Scalar(180, 180, 180));
+        y += 2;
     };
 
-    // drawChannel: 绘制一个完整的通道块(标题 + 内容文本)
-    auto drawChannel = [&](const std::string& label, const cv::Scalar& color,
-                           const SerialStatus& status) {
-        drawHeader(label, color, status);
-        std::string text = GetText(status);
-        if (text.empty()) text = "N/A";
-        auto lines = WrapLines(text, maxTextWidth);
-        for (const auto& line : lines) {
-            drawLine(line, cv::Scalar(200, 200, 200)); // 浅灰色内容文字
-        }
-        y += 4; // 通道之间的间距
-    };
+    // ===== SERIAL TX =====
+    drawSec("=== SERIAL TX ===");
+    drawCh("0x0305", "Position Coords",   cv::Scalar(  0,255,255), tx0305);
+    drawCh("0x0121", "Radar CMD (0121)",  cv::Scalar(255,200,  0), tx0121);
+    drawCh("0x0301", "Custom Data (0206)",cv::Scalar(  0,255,  0), tx0301);
 
-    // ---- 按顺序绘制 9 个通道 ----
-    // 每个通道使用不同颜色以便快速区分
+    // ===== SERIAL RX =====
+    drawSec("=== SERIAL RX ===");
+    drawCh("0x020E", "Radar Info",        cv::Scalar(255,150,150), rx020E);
+    drawCh("0x0301", "Robot Pos (0200)",  cv::Scalar(150,255,150), rx0301);
+    drawCh("0x0001", "Game Status",       cv::Scalar(100,200,255), rx0001);
+    drawCh("0x0003", "Outpost HP",        cv::Scalar(255,200,100), rx0003);
+    drawCh("0x0101", "Energy State",      cv::Scalar(255,200,255), rx0101);
 
-    // TX 发送通道 (3个)
-    drawChannel("TX 0x0305", cv::Scalar(0, 255, 255), tx0305);    // 黄色 - 位置坐标发送
-    drawChannel("TX 0x0121", cv::Scalar(255, 200, 0), tx0121);    // 橙色 - 雷达命令发送
-    drawChannel("TX 0x0301", cv::Scalar(0, 255, 0), tx0301);      // 绿色 - 自定义数据发送
+    // ===== TCP TX =====
+    drawSec("=== TCP TX ===");
+    drawCh("Trigger", "0x01 Signal (port 5000)", cv::Scalar(255,255,100), tcp01);
 
-    // RX 接收通道 (4个)
-    drawChannel("RX 0x020E", cv::Scalar(255, 150, 150), rx020E);  // 浅红 - 交互数据接收
-    drawChannel("RX 0x0301", cv::Scalar(150, 255, 150), rx0301);  // 浅绿 - 机器人位置接收
-    drawChannel("RX 0x0001 (GameStatus)", cv::Scalar(100, 200, 255), rx0001);  // 浅蓝 - 比赛状态
-    drawChannel("RX 0x0003 (Outpost)", cv::Scalar(255, 200, 100), rx0003);     // 浅橙 - 前哨站血量
+    // ===== TCP RX (Client -> 192.168.12.99) =====
+    drawSec("=== TCP RX (from 192.168.12.99) ===");
+    drawCh("8001", "0A01 Pos / 0A02-05 Data", cv::Scalar(255,150,255), tcpRx8001);
+    drawCh("8002", "0A06 Cracked Key L1",      cv::Scalar(200,150,200), tcpRx8002);
+    drawCh("8003", "0A06 Cracked Key L2",      cv::Scalar(200,150,200), tcpRx8003);
 
-    // TCP 通道 (2个)
-    drawChannel("TCP 0x01 (Trigger)", cv::Scalar(255, 255, 100), tcp01);       // 淡黄 - TCP触发
-    drawChannel("TCP Rx 8001", cv::Scalar(255, 150, 255), tcpRx8001);
-    drawChannel("TCP Rx 8002", cv::Scalar(200, 150, 200), tcpRx8002);
-    drawChannel("TCP Rx 8003", cv::Scalar(200, 150, 200), tcpRx8003);
-    drawChannel("TCP Rx 8004", cv::Scalar(200, 150, 200), tcpRx8004);         // 粉色 - TCP接收
-
-    // 将绘制好的画布显示到窗口
     cv::imshow(kWindowName, canvas);
 }
 

@@ -29,7 +29,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
+#include <iostream>
 namespace radar26 {
 namespace {
 
@@ -54,11 +54,13 @@ constexpr uint16_t kIncomingCmd020E = 0x020E;  // 雷达信息（双倍易伤/�
 constexpr uint16_t kIncomingCmd0301 = 0x0301;  // 机器人交互相应位置
 constexpr uint16_t kIncomingCmd0001 = 0x0001;  // 比赛状态（game_status_t）
 constexpr uint16_t kIncomingCmd0003 = 0x0003;  // 前哨站血量
+constexpr uint16_t kIncomingCmd0101 = 0x0101;  // 能量机关状态
 
 // 接收帧早期过滤：只保留白名单内的 cmd_id，减少后续 CRC 校验和解析开销
 bool IsIncomingSerialCmd(uint16_t cmdId) {
     return cmdId == kIncomingCmd020E || cmdId == kIncomingCmd0301 ||
-           cmdId == kIncomingCmd0001 || cmdId == kIncomingCmd0003;
+           cmdId == kIncomingCmd0001 || cmdId == kIncomingCmd0003 ||
+           cmdId == kIncomingCmd0101;
 }
 
 // 环形字节缓冲区：用于从串口/TCP 字节流中提取 0xA5 协议帧。
@@ -268,7 +270,8 @@ cv::Mat ResizeForDisplay(const cv::Mat& src, int maxWidth, int maxHeight) {
 // ============================================================================
 
 // 构造：保存配置副本（move 避免拷贝），其余成员在 Initialize() 中初始化
-RadarApp::RadarApp(AppConfig config) : config_(std::move(config)) {}
+RadarApp::RadarApp(AppConfig config, std::string configPath)
+    : config_(std::move(config)), configPath_(std::move(configPath)) {}
 
 // 析构：逆序关闭所有线程和连接
 RadarApp::~RadarApp() {
@@ -295,10 +298,14 @@ bool RadarApp::Initialize(std::string* error) {
         latestSerCoordFromDetection_[i].store(false, std::memory_order_relaxed);
     }
 
-    // 4. 生成随机 6 位 ASCII 密钥（初始己方密钥）
-    const std::string randomKey = GenerateRandomKey(6);
-    if (randomKey.size() != 6) { if (error) *error = "failed to generate random key"; return false; }
-    currentKey_ = KeyToArray(randomKey);
+    // 4. 初始己方密钥（DBD31D）
+    currentKey_ = KeyToArray("DBD31D");
+
+    // 4.5 初始化相机实时参数（曝光 + 增益）
+    targetExposure_.store(config_.camera.exposureTime, std::memory_order_relaxed);
+    targetGain_.store(config_.camera.gain, std::memory_order_relaxed);
+    lastSavedExposure_ = config_.camera.exposureTime;
+    lastSavedGain_ = config_.camera.gain;
 
     // 5. 加载两个 TensorRT 检测模型（车辆 + 装甲板）
     if (!carDetector_.Load(config_.model.carEnginePath, config_.model.carClassNames,
@@ -414,10 +421,10 @@ void RadarApp::TcpSendLoop() {
 
         // 触发2（一次性）：我方工程机器人到达指定位置（仅当真实检测到，盲区猜测不算）
         bool t2Fired = tcpTrigger2Fired_.load(std::memory_order_relaxed);
-        if (!t2Fired && engDetected) {
+        if (!t2Fired && gameProgress == 4 && engDetected && remainTime > 0) {
             const bool positionReached = (config_.team == Team::Blue)
                 ? (engCoordY > 400) : (engCoordY < 2200);
-            if (positionReached && remainTime<=360) {
+            if (positionReached) {
                 tcpTrigger2Fired_.store(true, std::memory_order_relaxed);
                 t2Fired = true;
                 shouldSend01 = true;
@@ -428,13 +435,13 @@ void RadarApp::TcpSendLoop() {
             }
         }
 
-        // 触发3（一次性）：剩余时间<300s 后只发一次
+        // 触发3（一次性）：剩余时间<180s 后只发一次
         bool t3Fired = tcpTrigger3Fired_.load(std::memory_order_relaxed);
-        if (!t3Fired && remainTime > 0 &&gameProgress==4 && remainTime < 180) {
+        if (!t3Fired && remainTime > 0 && gameProgress == 4 && remainTime < 180) {
             tcpTrigger3Fired_.store(true, std::memory_order_relaxed);
             t3Fired = true;
             shouldSend01 = true;
-            if (triggerReason.empty()) triggerReason = "T3: time<300s once";
+            if (triggerReason.empty()) triggerReason = "T3: time<180s once";
         }
         const bool t3Active = t3Fired;
 
@@ -462,10 +469,10 @@ void RadarApp::TcpSendLoop() {
             oss << " hpDn=" << (outpostHealthDecreased_.load() ? "Y" : "N")
                 << " | T1=" << (t1Fired ? "DONE" : "wait")
                 << " T2=" << (t2Fired ? "DONE" : "wait")
-                << " T3=" << (t3Active ? "ON" : "off");
-            if (!triggerReason.empty()) {
-                oss << " | " << triggerReason;
-            }
+                << " T3=" << (t3Active ? "ON" : "off")
+                << " | energy S=" << smallEnergyActivated_.load()
+                << " B=" << bigEnergyActivated_.load()
+                << " | dbl330=" << doubleTriggered330_ << " dbl180=" << doubleTriggered180_;
             UpdateSerialStatus(&tcp01_, 0, oss.str());
         }
 
@@ -476,34 +483,49 @@ void RadarApp::TcpSendLoop() {
 }
 
 // ---- TCP Client 接收线程：主动连接 192.168.12.99:8001~8004 ----
-static const char* kTcpRxIp = "192.168.50.112";
+//有线模式192.168.12.99
+static const char* kTcpRxIp = "192.168.12.99";
 
 void RadarApp::StartTcpReceivers() {
+    running_.store(true, std::memory_order_release);  // 确保接收线程看到 running_=true
+    fprintf(stderr, "[TCP-RX] starting receiver threads for ports 8001, 8002, 8003 ...\n");
+    fflush(stderr);
     tcpRxThread8001_ = std::thread(&RadarApp::TcpReaderLoop, this, 8001);
+    fprintf(stderr, "[TCP-RX] 8001 thread created\n");
+    fflush(stderr);
     tcpRxThread8002_ = std::thread(&RadarApp::TcpReaderLoop, this, 8002);
+    fprintf(stderr, "[TCP-RX] 8002 thread created\n");
+    fflush(stderr);
     tcpRxThread8003_ = std::thread(&RadarApp::TcpReaderLoop, this, 8003);
-    tcpRxThread8004_ = std::thread(&RadarApp::TcpReaderLoop, this, 8004);
+    fprintf(stderr, "[TCP-RX] 8003 thread created, all launched\n");
+    fflush(stderr);
 }
 
 void RadarApp::StopTcpReceivers() {
     if (tcpRxThread8001_.joinable()) tcpRxThread8001_.join();
     if (tcpRxThread8002_.joinable()) tcpRxThread8002_.join();
     if (tcpRxThread8003_.joinable()) tcpRxThread8003_.join();
-    if (tcpRxThread8004_.joinable()) tcpRxThread8004_.join();
 }
 
 // TCP Client 读取循环：connect → recv 流式数据 → 环形缓冲区解 0xA5 帧 → 回调 → 断线重连
 void RadarApp::TcpReaderLoop(int port) {
+    fprintf(stderr, "[TCP-RX:%d] thread started, running=%d\n", port,
+            static_cast<int>(running_.load(std::memory_order_relaxed)));
+    fflush(stderr);
     const auto reconnectDelay = std::chrono::seconds(2);
-    while (running_.load(std::memory_order_relaxed)) {
+    while (running_.load(std::memory_order_acquire)) {
         TcpClient client;
         std::string err;
+        fprintf(stderr, "[TCP-RX:%d] connecting to %s:%d ...\n", port, kTcpRxIp, port);
+        fflush(stderr);
         if (!client.Connect(kTcpRxIp, port, &err)) {
-            std::cerr << "[TCP-RX:" << port << "] " << err << std::endl;
+            fprintf(stderr, "[TCP-RX:%d] connect failed: %s\n", port, err.c_str());
+            fflush(stderr);
             std::this_thread::sleep_for(reconnectDelay);
             continue;
         }
-        std::cout << "[TCP-RX:" << port << "] connected" << std::endl;
+        fprintf(stderr, "[TCP-RX:%d] connected\n", port);
+        fflush(stderr);
 
         std::vector<uint8_t> ring(65536);
         std::size_t head = 0, sz = 0;
@@ -511,37 +533,24 @@ void RadarApp::TcpReaderLoop(int port) {
         const std::size_t kMaxPayload = 512;
         auto lastNoneTime = std::chrono::steady_clock::now();
 
-        while (running_.load(std::memory_order_relaxed)) {
+        int64_t bytesReceived = 0;
+        while (running_.load(std::memory_order_acquire)) {
             ssize_t n = client.Read(buf, sizeof(buf), &err);
-            if (n < 0) break;
+            if (n < 0) {
+                fprintf(stderr, "[TCP-RX:%d] %s (total rx=%ld bytes)\n", port, err.c_str(), bytesReceived);
+                break;
+            }
             if (n == 0) {
                 auto now = std::chrono::steady_clock::now();
                 if (now - lastNoneTime >= std::chrono::seconds(5)) {
-                    std::cout << "[TCP-RX:" << port << "] none" << std::endl;
+                    fprintf(stderr, "[TCP-RX:%d] no data (5s)\n", port);
                     lastNoneTime = now;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
 
-            // debug 模式：记录 TCP 原始字节流
-            if (config_.debug) {
-                static std::ofstream tcpLogs[5];
-                static bool tcpLogInited[5] = {false};
-                int li = (port == 8001) ? 0 : (port == 8002) ? 1 : (port == 8003) ? 2 : (port == 8004) ? 3 : 4;
-                if (!tcpLogInited[li]) {
-                    std::filesystem::create_directories("../logs");
-                    tcpLogs[li].open("../logs/raw_tcp_" + std::to_string(port) + ".log", std::ios::app);
-                    tcpLogInited[li] = true;
-                }
-                if (tcpLogs[li].is_open()) {
-                    for (ssize_t i = 0; i < n; ++i)
-                        tcpLogs[li] << "0x" << std::hex << std::uppercase << std::setw(2)
-                                    << std::setfill('0') << static_cast<int>(buf[i]) << ", ";
-                    tcpLogs[li] << std::endl;
-                }
-            }
-
+            bytesReceived += n;
             for (ssize_t i = 0; i < n; ++i) {
                 if (sz >= ring.size()) { head = (head + 1) % ring.size(); --sz; }
                 ring[(head + sz) % ring.size()] = buf[i]; ++sz;
@@ -559,17 +568,30 @@ void RadarApp::TcpReaderLoop(int port) {
                 frame.reserve(frameLen);
                 for (std::size_t i = 0; i < frameLen; ++i)
                     frame.push_back(ring[(head + i) % ring.size()]);
-                if (ParsePacket(frame).has_value()) {
+                static int parsedOk = 0, parseFail = 0;
+                static auto lastStatTime = std::chrono::steady_clock::now();
+                auto parsed = ParsePacket(frame);
+                if (parsed.has_value()) {
                     if (port == 8001) OnTcp8001Frame(frame);
                     else if (port == 8002) OnTcpKeyFrame(0, frame);
                     else if (port == 8003) OnTcpKeyFrame(1, frame);
-                    else if (port == 8004) OnTcpKeyFrame(2, frame);
+                    parsedOk++;
+                } else {
+                    parseFail++;
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastStatTime >= std::chrono::seconds(5)) {
+                    fprintf(stderr, "[TCP-RX:%d] 5s stats: %d parsed OK, %d CRC fail\n",
+                            port, parsedOk, parseFail);
+                    fflush(stderr);
+                    parsedOk = 0; parseFail = 0;
+                    lastStatTime = now;
                 }
                 head = (head + frameLen) % ring.size();
                 sz -= frameLen;
             }
         }
-        std::cerr << "[TCP-RX:" << port << "] disconnected, reconnecting..." << std::endl;
+        fprintf(stderr, "[TCP-RX:%d] disconnected, reconnecting...\n", port);
     }
 }
 
@@ -582,8 +604,8 @@ void RadarApp::OnTcp8001Frame(const std::vector<uint8_t>& frame) {
     switch (parsed->cmdId) {
     case 0x0201:  // 13字节，暂不解析，仅打印原始hex
     case 0x0202:  // 14字节，暂不解析，仅打印原始hex
-        std::cout << "[TCP-0x" << std::hex << parsed->cmdId << std::dec
-                  << "] raw: " << HexDump(parsed->payload) << std::endl;
+        std::cerr << "[TCP-RX:8001] 0x" << std::hex << parsed->cmdId << std::dec
+                  << " raw: " << HexDump(parsed->payload) << std::endl;
         UpdateSerialStatus(&tcpRx8001_, parsed->seq, HexDump(parsed->payload));
         break;
     case 0x0A01: {
@@ -595,39 +617,28 @@ void RadarApp::OnTcp8001Frame(const std::vector<uint8_t>& frame) {
             tcpCoords[i] = static_cast<int16_t>(parsed->payload[i * 2])
                          | (static_cast<int16_t>(parsed->payload[i * 2 + 1]) << 8);
 
-        // 逐机器人校验：视觉有 → 对比校验；视觉无 → 直接接受
-        auto filterData = filter_->GetAllData();
+        // 直接覆盖 TCP 数据到 tcpEnemyCoords_
         const std::vector<std::string> enemyNames =
             (config_.team == Team::Red)
                 ? std::vector<std::string>{"B1","B2","B3","B4","B6","B7"}
                 : std::vector<std::string>{"R1","R2","R3","R4","R6","R7"};
 
-        int accepted = 0, rejected = 0;
-        for (int i = 0; i < 6; ++i) {
-            auto it = filterData.find(enemyNames[i]);
-            if (it == filterData.end()) {
-                // 视觉未检测到此机器人 → 直接接受 TCP 数据
-                tcpEnemyCoords_[i * 2].store(tcpCoords[i * 2], std::memory_order_relaxed);
-                tcpEnemyCoords_[i * 2 + 1].store(tcpCoords[i * 2 + 1], std::memory_order_relaxed);
-                accepted++;
-            } else {
-                // 视觉有数据 → 校验
-                auto ser = MapToSerCoords(enemyNames[i], it->second.x, it->second.y);
-                int dx = std::abs(static_cast<int>(tcpCoords[i * 2])     - ser.first);
-                int dy = std::abs(static_cast<int>(tcpCoords[i * 2 + 1]) - ser.second);
-                if (dx <= 100 && dy <= 100) {
-                    tcpEnemyCoords_[i * 2].store(tcpCoords[i * 2], std::memory_order_relaxed);
-                    tcpEnemyCoords_[i * 2 + 1].store(tcpCoords[i * 2 + 1], std::memory_order_relaxed);
-                    accepted++;
-                } else {
-                    rejected++;
-                }
-            }
-        }
-        tcpEnemyCoordsValid_.store(accepted > 0, std::memory_order_release);
+        int accepted = 0;
         std::ostringstream oss;
-        oss << "0x0A01 accept=" << accepted << " reject=" << rejected;
-        UpdateSerialStatus(&tcpRx8001_, parsed->seq, oss.str());
+        for (int i = 0; i < 6; ++i) {
+            int16_t tx = tcpCoords[i * 2];
+            int16_t ty = tcpCoords[i * 2 + 1];
+            if (i % 3 == 0) oss << "\n ";
+            oss << enemyNames[i] << "(" << tx << "," << ty << ")";
+            tcpEnemyCoords_[i * 2].store(tx, std::memory_order_relaxed);
+            tcpEnemyCoords_[i * 2 + 1].store(ty, std::memory_order_relaxed);
+            sendLastSerCoords_[enemyNames[i]] = std::make_pair(static_cast<int>(tx), static_cast<int>(ty));
+            accepted++;
+        }
+        oss << "\n  accept=" << accepted;
+        tcp8001PosLine_ = oss.str();
+        tcpEnemyCoordsValid_.store(true, std::memory_order_release);
+        UpdateTcp8001Status(parsed->seq);
         break;
     }
     case 0x0A02: {
@@ -656,8 +667,19 @@ void RadarApp::OnTcp8001Frame(const std::vector<uint8_t>& frame) {
     }
     default: return;
     }
-    // 每次收到数据段都重写 tcp0206AllValid_（release），保证 SerialSendLoop 看到最新 tcp0206Data_
-    tcp0206AllValid_.store(true, std::memory_order_release);
+    // 四段全部到齐后显示完整 66 字节
+    if (tcp0206SegValid_[0].load(std::memory_order_relaxed) &&
+        tcp0206SegValid_[1].load(std::memory_order_relaxed) &&
+        tcp0206SegValid_[2].load(std::memory_order_relaxed) &&
+        tcp0206SegValid_[3].load(std::memory_order_relaxed)) {
+        bool wasValid = tcp0206AllValid_.load(std::memory_order_relaxed);
+        tcp0206AllValid_.store(true, std::memory_order_release);
+        if (!wasValid) {
+            std::vector<uint8_t> all66(tcp0206Data_.data(), tcp0206Data_.data() + 66);
+            tcp8001DataLine_ = "66B " + HexDump(all66);
+            UpdateTcp8001Status(0);
+        }
+    }
 }
 
 void RadarApp::OnTcpKeyFrame(int level, const std::vector<uint8_t>& frame) {
@@ -668,11 +690,28 @@ void RadarApp::OnTcpKeyFrame(int level, const std::vector<uint8_t>& frame) {
         tcpCrackedKey_[level][i] = parsed->payload[i];
     tcpCrackedKeyValid_[level].store(true, std::memory_order_release);
 
+    const int port = 8002 + level;  // level 0→8002, 1→8003, 2→8004
+    std::string keyStr = KeyToString(tcpCrackedKey_[level]);
+    std::cerr << "[TCP-RX:" << port << "] 0x0A06 key L" << (level + 1)
+              << " = " << keyStr << std::endl;
+
     std::ostringstream oss;
-    oss << "0x0A06 key L" << (level + 1) << "=" << KeyToString(tcpCrackedKey_[level]);
-    // level 0→8002, 1→8003, 2→8004
-    SerialStatus* rxSt = (level == 0) ? &tcpRx8002_ : (level == 1) ? &tcpRx8003_ : &tcpRx8004_;
+    oss << "0x0A06 key L" << (level + 1) << "=" << keyStr;
+    SerialStatus* rxSt = (level == 0) ? &tcpRx8002_ : &tcpRx8003_;
     UpdateSerialStatus(rxSt, parsed->seq, oss.str());
+}
+
+void RadarApp::UpdateTcp8001Status(uint8_t seq) {
+    std::string combined;
+    if (tcp8001PosLine_.empty()) {
+        combined = "waiting data...";
+    } else {
+        combined = tcp8001PosLine_;
+    }
+    if (!tcp8001DataLine_.empty()) {
+        combined += "\n" + tcp8001DataLine_;
+    }
+    UpdateSerialStatus(&tcpRx8001_, seq, combined);
 }
 
 void RadarApp::StartSerialThreads() {
@@ -739,52 +778,6 @@ void RadarApp::SerialSendLoop() {
                 ? std::vector<std::string>{"B1","B2","B3","B4","B6","B7"}
                 : std::vector<std::string>{"R1","R2","R3","R4","R6","R7"};
 
-        // debug 模式：阶段4时的时间戳日志
-        const uint16_t dbgRemain = latestStageRemainTime_.load(std::memory_order_relaxed);
-        const uint8_t  dbgProgress = latestGameProgress_.load(std::memory_order_relaxed);
-        const bool dbgLog = config_.debug && dbgProgress == 4;
-        // debug 0x0305 模式：前4分钟(>180s)用TCP不校验，后3分钟(≤180s)只用视觉
-        const bool dbgTcpNoCheck = config_.debug && dbgRemain > 180;
-        const bool dbgVisionOnly  = config_.debug && dbgRemain > 0 && dbgRemain <= 180;
-
-        if (dbgLog) {
-            static std::ofstream visLog, tcpLog;
-            static bool logInited = false;
-            if (!logInited) {
-                std::filesystem::create_directories("../logs");
-                auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                std::ostringstream ts;
-                ts << std::put_time(std::localtime(&t), "%H:%M:%S");
-                visLog.open("../logs/vision_coords.log", std::ios::app);
-                tcpLog.open("../logs/tcp0A01_coords.log", std::ios::app);
-                visLog << "=== " << ts.str() << " ===" << std::endl;
-                tcpLog << "=== " << ts.str() << " ===" << std::endl;
-                logInited = true;
-            }
-            if (visLog.is_open()) {
-                auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                visLog << std::put_time(std::localtime(&t), "%H:%M:%S") << " remain=" << dbgRemain << "s | ";
-                for (const auto& n : robotOrder) {
-                    auto it = allData.find(n);
-                    if (it != allData.end())
-                        visLog << n << "(" << (int)it->second.x << "," << (int)it->second.y << ") ";
-                    else
-                        visLog << n << "(N/A) ";
-                }
-                visLog << std::endl;
-            }
-            if (tcpLog.is_open() && tcpEnemyCoordsValid_.load(std::memory_order_acquire)) {
-                auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                tcpLog << std::put_time(std::localtime(&t), "%H:%M:%S") << " remain=" << dbgRemain << "s | ";
-                for (int i = 0; i < 6; ++i) {
-                    int16_t cx = tcpEnemyCoords_[i * 2].load(std::memory_order_relaxed);
-                    int16_t cy = tcpEnemyCoords_[i * 2 + 1].load(std::memory_order_relaxed);
-                    tcpLog << enemyNames[i] << "(" << cx << "," << cy << ") ";
-                }
-                tcpLog << std::endl;
-            }
-        }
-
         for (std::size_t ri = 0; ri < robotOrder.size(); ++ri) {
             const std::string& name = robotOrder[ri];
             int sx = 0, sy = 0;
@@ -792,35 +785,30 @@ void RadarApp::SerialSendLoop() {
             bool isEnemy = (ri < 6);
             auto dataIt = allData.find(name);
 
-            if (dbgTcpNoCheck && isEnemy && tcpEnemyCoordsValid_.load(std::memory_order_acquire)) {
-                // debug：前4分钟 0x0A01 不校验直接覆盖对方
-                sx = static_cast<int>(tcpEnemyCoords_[ri * 2].load(std::memory_order_relaxed));
-                sy = static_cast<int>(tcpEnemyCoords_[ri * 2 + 1].load(std::memory_order_relaxed));
-                sendLastSerCoords_[name] = std::make_pair(sx, sy);
-            } else if (dbgVisionOnly) {
-                // debug：后3分钟只用视觉
-                if (dataIt != allData.end()) {
-                    const auto mapped = MapToSerCoords(name, dataIt->second.x, dataIt->second.y);
-                    sx = mapped.first; sy = mapped.second;
-                    sendLastSerCoords_[name] = mapped;
-                    fromDetection = true;
-                } else {
-                    const auto lastIt = sendLastSerCoords_.find(name);
-                    if (lastIt != sendLastSerCoords_.end() && lastIt->second.has_value()) {
-                        sx = lastIt->second->first; sy = lastIt->second->second;
+            if (isEnemy && tcpEnemyCoordsValid_.load(std::memory_order_acquire)) {
+                const int tcpSx = static_cast<int>(tcpEnemyCoords_[ri * 2].load(std::memory_order_relaxed));
+                const int tcpSy = static_cast<int>(tcpEnemyCoords_[ri * 2 + 1].load(std::memory_order_relaxed));
+                if (config_.debug) {
+                    sx = tcpSx; sy = tcpSy;
+                } else if (dataIt != allData.end()) {
+                    const auto visMapped = MapToSerCoords(name, dataIt->second.x, dataIt->second.y);
+                    constexpr int kMaxDist = 300;
+                    if (std::abs(tcpSx - visMapped.first) <= kMaxDist &&
+                        std::abs(tcpSy - visMapped.second) <= kMaxDist) {
+                        sx = tcpSx; sy = tcpSy;
+                    } else {
+                        sx = visMapped.first; sy = visMapped.second; fromDetection = true;
                     }
+                } else {
+                    sx = tcpSx; sy = tcpSy;
                 }
+                sendLastSerCoords_[name] = std::make_pair(sx, sy);
             } else if (dataIt != allData.end()) {
-                // 正常：摄像头检测到 → 用摄像头坐标
+                // 摄像头检测到 → 用摄像头坐标
                 const auto mapped = MapToSerCoords(name, dataIt->second.x, dataIt->second.y);
                 sx = mapped.first; sy = mapped.second;
                 sendLastSerCoords_[name] = mapped;
                 fromDetection = true;
-            } else if (isEnemy && tcpEnemyCoordsValid_.load(std::memory_order_acquire)) {
-                // 正常：未检测到的对方机器人用 0x0A01 TCP 坐标
-                sx = static_cast<int>(tcpEnemyCoords_[ri * 2].load(std::memory_order_relaxed));
-                sy = static_cast<int>(tcpEnemyCoords_[ri * 2 + 1].load(std::memory_order_relaxed));
-                sendLastSerCoords_[name] = std::make_pair(sx, sy);
             } else {
                 const auto lastIt = sendLastSerCoords_.find(name);
                 if (lastIt != sendLastSerCoords_.end() && lastIt->second.has_value()) {
@@ -842,6 +830,7 @@ void RadarApp::SerialSendLoop() {
             }
         }
 
+
         std::vector<uint8_t> posPacket;
         std::string error;
         if (BuildPositionPacket(seq, coords, &posPacket, &error)) {
@@ -854,8 +843,11 @@ void RadarApp::SerialSendLoop() {
 
         {
             const uint16_t senderId = (config_.team == Team::Red) ? 9 : 109;
-            const uint16_t receiverId = (config_.team == Team::Red) ? 6 : 106;
-            std::vector<uint8_t> customPacket;
+            // 0x0206 只发给己方：红方→1,3,4,6,7  蓝方→101,103,104,106,107
+            const std::vector<uint16_t> receiverIds =
+                (config_.team == Team::Red)
+                    ? std::vector<uint16_t>{1, 3, 4, 6, 7}
+                    : std::vector<uint16_t>{101, 103, 104, 106, 107};
 
             // 0x0206 66B 定频 1Hz 转发
             bool tcp66FwdNow = false;
@@ -866,29 +858,35 @@ void RadarApp::SerialSendLoop() {
                     lastTcpFwdTime_ = tcpNow;
                 }
             }
+            auto pushU16 = [&](std::vector<uint8_t>& d, uint16_t v) {
+                d.push_back(static_cast<uint8_t>(v & 0xFF));
+                d.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+            };
             if (tcp66FwdNow && tcp0206AllValid_.load(std::memory_order_acquire)) {
-                // 用 TCP 接收的 66 字节真实数据代替默认填充
-                std::vector<uint8_t> data;
-                data.reserve(72);
-                auto pushU16 = [&](uint16_t v) {
-                    data.push_back(static_cast<uint8_t>(v & 0xFF));
-                    data.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
-                };
-                pushU16(0x0206);
-                pushU16(senderId);
-                pushU16(receiverId);
-                for (int i = 0; i < 66; ++i) data.push_back(tcp0206Data_[static_cast<std::size_t>(i)]);
-                customPacket = BuildGeneralPacket(seq, 0x0301, data);
-                if (serial_->Write(customPacket, &error)) {
-                    std::string sentText = HexDump(customPacket) + " | tcp0206 sender=" + std::to_string(senderId);
-                    UpdateSerialStatus(&tx0301_, seq, sentText);
+                for (uint16_t rid : receiverIds) {
+                    std::vector<uint8_t> data;
+                    data.reserve(72);
+                    pushU16(data, 0x0206);
+                    pushU16(data, senderId);
+                    pushU16(data, rid);
+                    for (int i = 0; i < 66; ++i) data.push_back(tcp0206Data_[i]);
+                    std::vector<uint8_t> pkt = BuildGeneralPacket(seq, 0x0301, data);
+                    std::string err;
+                    if (serial_->Write(pkt, &err)) {
+                        UpdateSerialStatus(&tx0301_, seq, "tcp0206 ->" + std::to_string(rid));
+                    }
+                    ++seq;
                 }
-            } else if (!tcp0206AllValid_.load(std::memory_order_acquire)
-                       && BuildRadarCustomData0301Packet(seq, senderId, receiverId, &customPacket, &error)) {
-                if (serial_->Write(customPacket, &error)) {
-                    std::string sentText = HexDump(customPacket) + " | sender=" + std::to_string(senderId)
-                                           + " receiver=" + std::to_string(receiverId);
-                    UpdateSerialStatus(&tx0301_, seq, sentText);
+            } else if (!tcp0206AllValid_.load(std::memory_order_acquire)) {
+                for (uint16_t rid : receiverIds) {
+                    std::vector<uint8_t> pkt;
+                    std::string err;
+                    if (BuildRadarCustomData0301Packet(seq, senderId, rid, &pkt, &err)) {
+                        if (serial_->Write(pkt, &err)) {
+                            UpdateSerialStatus(&tx0301_, seq, "default ->" + std::to_string(rid));
+                        }
+                    }
+                    ++seq;
                 }
             }
         }
@@ -925,31 +923,23 @@ void RadarApp::SerialSendLoop() {
                 const int keyMod    = std::max(0, keyModifiable_.load(std::memory_order_relaxed));
                 const int encLvl    = std::max(0, encryptLevel_.load(std::memory_order_relaxed));
 
-                // ---- 触发 A：双倍易伤（上升沿：0→非0，上限 2 次）----
-                static int prevChance = 0;
-                if (chance > 0 && prevChance == 0 && doubleTriggerCount_ < 2) {
-                    doubleTriggerCount_++;
-                    if (doubleTriggerCount_ == 0) doubleTriggerCount_ = 1;
-                    const std::array<uint8_t, 6> zeroKey{};
-                    send0121(doubleTriggerCount_, 0, zeroKey, "DOUBLE");
-                }
-                prevChance = chance;
 
                 // ---- 触发 B：修改密钥（上升沿：0→1）----
                 static int prevKeyMod = 0;
                 if (keyMod == 1 && prevKeyMod == 0) {
-                    currentKey_ = KeyToArray(GenerateRandomKey(6));
                     keyModCount_++;
                     if (keyModCount_ == 0) keyModCount_ = 1;
+                    static const std::array<const char*, 3> kFixedKeys = {"DBD31D", "C74B91", "2E4512"};
+                    currentKey_ = KeyToArray(std::string(kFixedKeys[(keyModCount_ - 1) % 3]));
                     send0121(keyModCount_, 1, currentKey_, "KEYMOD");
                 }
                 prevKeyMod = keyMod;
 
                 // ---- 触发 C：破解密钥 ----
-                // 条件：encryptLevel>=1，10s 冷却，对应端口密钥 valid
-                if (encLvl >= 1 && encLvl <= 3) {
+                // encryptLevel>=1 + 13s冷却 + 端口密钥valid
+                if (encLvl >= 1 && encLvl <= 2) {
                     const auto now = std::chrono::steady_clock::now();
-                    if (now - lastCrackedSendTime_ >= std::chrono::seconds(10)) {
+                    if (now - lastCrackedSendTime_ >= std::chrono::seconds(13)) {
                         const int lvlIdx = encLvl - 1;
                         if (tcpCrackedKeyValid_[lvlIdx].load(std::memory_order_acquire)) {
                             lastCrackedSendTime_ = now;
@@ -957,6 +947,41 @@ void RadarApp::SerialSendLoop() {
                             if (crackedKeyCount_ == 0) crackedKeyCount_ = 1;
                             send0121(crackedKeyCount_, 2, tcpCrackedKey_[lvlIdx],
                                      "CRACKED L" + std::to_string(encLvl));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 双倍易伤触发：阶段4 + chance>0 + 两个时间窗口各触发一次 ----
+        {
+            const uint8_t  stage = latestGameProgress_.load(std::memory_order_relaxed);
+            const uint16_t remain = latestStageRemainTime_.load(std::memory_order_relaxed);
+            const int chance = std::max(0, doubleVulnerabilityChance_.load(std::memory_order_relaxed));
+            if (stage == 4 && remain > 0 && chance > 0) {
+                bool triggerNow = false;
+                if (remain < 330 && !doubleTriggered330_) {
+                    doubleTriggered330_ = true;
+                    triggerNow = true;
+                }
+                if (remain < 180 && !doubleTriggered180_) {
+                    doubleTriggered180_ = true;
+                    triggerNow = true;
+                }
+                if (triggerNow) {
+                    const uint16_t sid = (config_.team == Team::Red) ? 9 : 109;
+                    const std::array<uint8_t, 6> zeroKey{};
+                    std::string err;
+                    for (uint8_t cmd : {uint8_t(1), uint8_t(2)}) {
+                        std::vector<uint8_t> dpkt;
+                        if (BuildRadarCmdPacket(seq, sid, cmd, 0, zeroKey, &dpkt, &err)) {
+                            serial_->Write(dpkt, &err);
+                            std::ostringstream oss;
+                            oss << "DOUBLE cmd=" << static_cast<int>(cmd)
+                                << " chance=" << chance
+                                << " remain=" << remain << "s";
+                            UpdateSerialStatus(&tx0121_, seq, oss.str());
+                            ++seq;
                         }
                     }
                 }
@@ -990,23 +1015,6 @@ void RadarApp::SerialReceiveLoop() {
         if (n == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
 
         buffer.push(chunk.data(), static_cast<std::size_t>(n));
-
-        // debug 模式：记录原始字节流到 log 文件
-        if (config_.debug) {
-            static std::ofstream serialLog;
-            static bool serialLogInited = false;
-            if (!serialLogInited) {
-                std::filesystem::create_directories("../logs");
-                serialLog.open("../logs/raw_serial.log", std::ios::app);
-                serialLogInited = true;
-            }
-            if (serialLog.is_open()) {
-                for (ssize_t i = 0; i < n; ++i)
-                    serialLog << "0x" << std::hex << std::uppercase << std::setw(2)
-                              << std::setfill('0') << static_cast<int>(chunk[i]) << ", ";
-                serialLog << std::endl;
-            }
-        }
 
         while (buffer.size() >= 9U) {
             std::size_t cursor = 0U;
@@ -1083,10 +1091,7 @@ void RadarApp::ParserWorker() {
             encryptLevel_.store(bits.encryptLevel, std::memory_order_relaxed);
             keyModifiable_.store(bits.keyModifiable, std::memory_order_relaxed);
             hasRadarInfo020E_.store(true, std::memory_order_release);
-            
-            canTriggerDoubleNow_.store(
-                (bits.hasOpportunity > 0U) && (bits.enemyTriggered == 0U),
-                std::memory_order_relaxed);
+
             doubleTriggerEpoch_.fetch_add(1, std::memory_order_relaxed);  // 每次 0x020E 都递增
 
             std::string parsedInfo = BuildRadarInfoStatus(parsed->payload[0], bits);
@@ -1112,6 +1117,28 @@ void RadarApp::ParserWorker() {
                 << " rsv0=" << message.positions.reserved0
                 << " rsv1=" << message.positions.reserved1;
             UpdateSerialStatus(&rx0301_, parsed->seq, oss.str());
+
+            // 0x0200 子内容：己方机器人真实坐标，直接覆盖到 sendLastSerCoords_
+            {
+                const bool isRedAlly = (config_.team == Team::Red);
+                using P = std::pair<std::string, std::pair<float, float>>;
+                const std::vector<P> allyPos = {
+                    {isRedAlly ? "R1" : "B1", {message.positions.heroX, message.positions.heroY}},
+                    {isRedAlly ? "R2" : "B2", {message.positions.engineerX, message.positions.engineerY}},
+                    {isRedAlly ? "R3" : "B3", {message.positions.infantry3X, message.positions.infantry3Y}},
+                    {isRedAlly ? "R4" : "B4", {message.positions.infantry4X, message.positions.infantry4Y}},
+                };
+                for (const auto& [rname, coord] : allyPos) {
+                    const auto mapped = MapToSerCoords(rname, coord.first, coord.second);
+                    sendLastSerCoords_[rname] = mapped;
+                    int slot = RobotNameToIndex(rname);
+                    if (slot >= 0) {
+                        latestSerCoordX_[slot].store(mapped.first, std::memory_order_relaxed);
+                        latestSerCoordY_[slot].store(mapped.second, std::memory_order_relaxed);
+                        latestSerCoordValid_[slot].store(true, std::memory_order_release);
+                    }
+                }
+            }
         // 0x0001: 比赛状态，解析game_type(game_progress和stage_remain_time
         } else if (parsed->cmdId == 0x0001) {
             GameStatus gameStatus;
@@ -1150,6 +1177,15 @@ void RadarApp::ParserWorker() {
             oss << "cmd=0x0003 seq=" << static_cast<int>(parsed->seq)
                 << " outpost_health=" << outpostHealth.health;
             UpdateSerialStatus(&rx0003_, parsed->seq, oss.str());
+        // 0x0101：能量机关状态，4字节payload
+        } else if (parsed->cmdId == 0x0101 && parsed->payload.size() == 4U) {
+            const uint8_t b = parsed->payload[0];
+            smallEnergyActivated_.store((b >> 3) & 0x03, std::memory_order_relaxed);
+            bigEnergyActivated_.store((b >> 5) & 0x03, std::memory_order_relaxed);
+            std::ostringstream oss;
+            oss << "cmd=0x0101 small=" << ((b >> 3) & 0x03)
+                << " big=" << ((b >> 5) & 0x03);
+            UpdateSerialStatus(&rx0101_, parsed->seq, oss.str());
         }
     }
 }
@@ -1177,47 +1213,6 @@ void RadarApp::UpdateSerialStatus(SerialStatus* status, uint8_t seq, const std::
     std::atomic_store_explicit(&status->lastText,
                                std::make_shared<const std::string>(text.empty() ? std::string("N/A") : text),
                                std::memory_order_release);
-}
-
-bool RadarApp::UpdateRadarInfoFromParsedPacket(const ParsedPacket& parsed) {
-    if (parsed.cmdId == 0x020E && parsed.payload.size() == 1U) {
-        const RadarInfoBits bits = DecodeRadarInfoByte(parsed.payload[0]);
-        doubleVulnerabilityChance_.store(bits.hasOpportunity, std::memory_order_relaxed);
-        opponentDoubleTriggered_.store(bits.enemyTriggered, std::memory_order_relaxed);
-        encryptLevel_.store(bits.encryptLevel, std::memory_order_relaxed);
-        keyModifiable_.store(bits.keyModifiable, std::memory_order_relaxed);
-        hasRadarInfo020E_.store(true, std::memory_order_release);
-
-        canTriggerDoubleNow_.store(
-            (bits.hasOpportunity > 0U) && (bits.enemyTriggered == 0U),
-            std::memory_order_relaxed);
-        doubleTriggerEpoch_.fetch_add(1, std::memory_order_relaxed);  // 每次 0x020E 都递增
-        // include raw payload hex and parsed info for overlay
-        std::string payloadHex = HexDump(parsed.payload);
-        std::string parsedInfo = BuildRadarInfoStatus(parsed.payload[0], bits);
-        std::string combined = std::string("cmd=0x020E seq=") + std::to_string(parsed.seq) + " payload=" + payloadHex + " | " + parsedInfo;
-        UpdateSerialStatus(&rx020E_, parsed.seq, combined);
-        return true;
-    }
-    if (parsed.cmdId == 0x0301) {
-        RobotInteractionPositions0301 message;
-        std::string error;
-        if (!DecodeAllyRobotPositions0301(parsed, &message, &error)) {
-            UpdateSerialStatus(&rx0301_, parsed.seq, std::string("decode failed: ") + error);
-            return false;
-        }
-
-        std::ostringstream oss;
-        oss << "cmd=0x0301 seq=" << static_cast<int>(parsed.seq)
-            << " dataCmd=0x" << std::hex << std::uppercase << message.dataCmdId
-            << " sender=" << std::dec << message.senderId
-            << " receiver=" << message.receiverId
-            << " hero=(" << message.positions.heroX << "," << message.positions.heroY << ")"
-            << " engineer=(" << message.positions.engineerX << "," << message.positions.engineerY << ")";
-        UpdateSerialStatus(&rx0301_, parsed.seq, oss.str());
-        return true;
-    }
-    return false;
 }
 
 void RadarApp::Run() {
@@ -1248,9 +1243,17 @@ void RadarApp::Run() {
     // 创建窗口
     cv::namedWindow("img", cv::WINDOW_NORMAL);
     cv::namedWindow("map", cv::WINDOW_NORMAL);
-    if (config_.serial.enable) {
+    if (config_.showUi) {
         serialMonitor_.Open();
     }
+
+    // 相机参数调节滑轨（曝光 0~20000 us，增益 0~200 即 0.0~20.0）
+    const int initExp = static_cast<int>(config_.camera.exposureTime);
+    const int initGain = static_cast<int>(config_.camera.gain * 10.0);
+    cv::createTrackbar("Exposure(us)", "img", nullptr, 20000);
+    cv::createTrackbar("Gain(x0.1)",   "img", nullptr, 200);
+    cv::setTrackbarPos("Exposure(us)", "img", std::clamp(initExp, 0, 20000));
+    cv::setTrackbarPos("Gain(x0.1)",   "img", std::clamp(initGain, 0, 200));
 
     // 启动抓帧线程
     std::thread grabThread([&]() {
@@ -1316,11 +1319,29 @@ void RadarApp::Run() {
             return;
         }
 
+        double curExp = targetExposure_.load(std::memory_order_relaxed);
+        double curGain = targetGain_.load(std::memory_order_relaxed);
+
         while (running_) {
             cv::Mat frame;
             if (!dahengCamera.Read(&frame, &error)) {
                 continue;
             }
+
+            // 轮询相机参数变更并应用到硬件
+            const double newExp = targetExposure_.load(std::memory_order_relaxed);
+            const double newGain = targetGain_.load(std::memory_order_relaxed);
+            if (newExp != curExp) {
+                std::string err;
+                dahengCamera.SetExposureTime(newExp, &err);
+                curExp = newExp;
+            }
+            if (newGain != curGain) {
+                std::string err;
+                dahengCamera.SetGain(newGain, &err);
+                curGain = newGain;
+            }
+
             std::lock_guard<std::mutex> lk(frameMutex_);
             std::swap(latestFrame_, frame);
             frameReady_.store(true, std::memory_order_release);
@@ -1486,39 +1507,42 @@ void RadarApp::Run() {
                     }
                 }
 
+                // 视觉定位坐标写入 sendLastSerCoords_（供地图绘制 + 0x0305发送）
                 if (added) {
                     auto ser = MapToSerCoords(name, static_cast<float>(mx), static_cast<float>(my));
-                    int slot = RobotNameToIndex(name);
-                    if (slot >= 0) {
-                        latestSerCoordX_[static_cast<std::size_t>(slot)].store(ser.first, std::memory_order_relaxed);
-                        latestSerCoordY_[static_cast<std::size_t>(slot)].store(ser.second, std::memory_order_relaxed);
-                        latestSerCoordFromDetection_[static_cast<std::size_t>(slot)].store(true, std::memory_order_relaxed);
-                        latestSerCoordValid_[static_cast<std::size_t>(slot)].store(true, std::memory_order_release);
-                        latestDetectedType_[static_cast<std::size_t>(slot)] = det.className;
-                    }
+                    sendLastSerCoords_[name] = ser;
                 }
             }
         }
 
-        // 地图绘制
-        auto allFilterData = filter_->GetAllData();
+        // 地图绘制：显示所有12个校验过的机器人位置坐标（来自 latestSerCoord*）
         cv::Mat mapShow;
         if (config_.showUi) {
             mapShow = mapBaseShow.clone();
             const int r = std::max(4, static_cast<int>(std::lround(10.0F * mapScaleMin)));
             const double nameScale = std::max(0.55, 1.6 * static_cast<double>(mapScaleMin));
             const int nameThick = std::max(1, static_cast<int>(std::lround(2.2F * mapScaleMin)));
-            for (const auto& kv : allFilterData) {
-                float mx = kv.second.x, my = kv.second.y;
+            for (std::size_t slot = 0; slot < kAllRobotNames.size(); ++slot) {
+                if (!latestSerCoordValid_[slot].load(std::memory_order_acquire)) continue;
+                std::string name = kAllRobotNames[slot];
+                int serX = latestSerCoordX_[slot].load(std::memory_order_relaxed);
+                int serY = latestSerCoordY_[slot].load(std::memory_order_relaxed);
+
+                // serial坐标 → map坐标
+                float mx, my;
+                if (name[0] == 'R') { my = static_cast<float>(serX); mx = 1500.0F - static_cast<float>(serY); }
+                else                { my = 2800.0F - static_cast<float>(serX); mx = 1500.0F - static_cast<float>(serY); }
+
+                // map坐标 → 地图显示坐标
                 float sx, sy;
                 if (config_.team == Team::Red) { sx = 2800.0F - my; sy = mx; }
-                else { sx = my; sy = 1500.0F - mx; }
+                else                           { sx = my; sy = 1500.0F - mx; }
                 sx *= mapScaleX; sy *= mapScaleY;
-                cv::Scalar col = TeamColor(kv.first);
+
+                cv::Scalar col = TeamColor(name);
                 cv::circle(mapShow, cv::Point(static_cast<int>(sx), static_cast<int>(sy)), r, col, -1);
-                // show only a single label: name (x,y) with a smaller font
                 std::ostringstream coordText;
-                coordText << kv.first << " (" << static_cast<int>(std::lround(mx)) << "," << static_cast<int>(std::lround(my)) << ")";
+                coordText << name << " (" << static_cast<int>(mx) << "," << static_cast<int>(my) << ")";
                 const double labelScale = std::max(0.35, 0.5 * mapScaleMin);
                 const int labelThick = 1;
                 cv::putText(mapShow, coordText.str(),
@@ -1529,23 +1553,94 @@ void RadarApp::Run() {
 
         // 串口监视窗口
         if (config_.showUi) {
-            serialMonitor_.Update(tx0305_, tx0121_, tx0301_, rx020E_, rx0301_, rx0001_, rx0003_, tcp01_,
-                                  tcpRx8001_, tcpRx8002_, tcpRx8003_, tcpRx8004_);
+            serialMonitor_.Update(tx0305_, tx0121_, tx0301_, rx020E_, rx0301_, rx0001_, rx0003_, rx0101_,
+                                  tcp01_, tcpRx8001_, tcpRx8002_, tcpRx8003_);
         }
 
         if (config_.showUi) {
+            cv::putText(imgShow, "Q: quit", cv::Point(imgShow.cols - 150, 28),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.60, cv::Scalar(0, 255, 0), 2);
             cv::imshow("img", imgShow);
             cv::imshow("map", mapShow);
         }
 
         int key = cv::waitKey(1) & 0xFF;
         if (key == 'q') { running_ = false; break; }
+
+        // 读取相机参数滑轨，变更时更新原子变量并写回 app.yaml
+        if (config_.showUi) {
+            const int trackExp = cv::getTrackbarPos("Exposure(us)", "img");
+            const int trackGain = cv::getTrackbarPos("Gain(x0.1)", "img");
+            const double newExp = static_cast<double>(std::clamp(trackExp, 0, 20000));
+            const double newGain = static_cast<double>(std::clamp(trackGain, 0, 200)) / 10.0;
+            targetExposure_.store(newExp, std::memory_order_relaxed);
+            targetGain_.store(newGain, std::memory_order_relaxed);
+            if (newExp != lastSavedExposure_ || newGain != lastSavedGain_) {
+                lastSavedExposure_ = newExp;
+                lastSavedGain_ = newGain;
+                config_.camera.exposureTime = newExp;
+                config_.camera.gain = newGain;
+                SaveCameraParams();
+            }
+        }
+
         auto tNow = std::chrono::steady_clock::now();
     }
 
     running_ = false;
     if (grabThread.joinable()) grabThread.join();
     cv::destroyAllWindows();
+}
+
+// 将当前 exposure_time / gain 写回 app.yaml（行级替换，保留格式与注释）
+void RadarApp::SaveCameraParams() const {
+    std::ifstream ifs(configPath_);
+    if (!ifs.is_open()) return;
+    std::vector<std::string> lines;
+    std::string line;
+    bool inCamera = false;
+    while (std::getline(ifs, line)) {
+        // 检测 camera: 节开始 / 下一节结束
+        if (!inCamera && line.find("camera:") != std::string::npos && line.find_first_not_of(" \t") == 0) {
+            inCamera = true;
+        } else if (inCamera && !line.empty() && (line[0] != ' ' && line[0] != '\t')) {
+            inCamera = false;  // 回到顶层键，退出 camera 节
+        }
+        if (inCamera) {
+            // 匹配 "  exposure_time: <value>"
+            auto expPos = line.find("exposure_time:");
+            if (expPos != std::string::npos && expPos > 0 && line[expPos - 1] == ' ') {
+                std::ostringstream oss;
+                oss << std::fixed << std::setprecision(1) << config_.camera.exposureTime;
+                auto valStart = line.find_first_of("0123456789", expPos);
+                auto valEnd   = line.find_first_not_of("0123456789.", valStart);
+                if (valStart != std::string::npos) {
+                    line.replace(valStart, (valEnd == std::string::npos ? line.size() : valEnd) - valStart, oss.str());
+                }
+            }
+            // 匹配 "  gain: <value>"
+            auto gainPos = line.find("gain:");
+            if (gainPos != std::string::npos && gainPos > 0 && line[gainPos - 1] == ' ') {
+                // 确保不是 "gain" 子串（如 "daheng_auto_white_balance" 中的）
+                if (gainPos < 3 || line.substr(0, gainPos).find_first_not_of(" \t") == std::string::npos
+                    || line[gainPos - 1] != '_') {
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(1) << config_.camera.gain;
+                    auto valStart = line.find_first_of("0123456789", gainPos);
+                    auto valEnd   = line.find_first_not_of("0123456789.", valStart);
+                    if (valStart != std::string::npos) {
+                        line.replace(valStart, (valEnd == std::string::npos ? line.size() : valEnd) - valStart, oss.str());
+                    }
+                }
+            }
+        }
+        lines.push_back(line);
+    }
+    ifs.close();
+
+    std::ofstream ofs(configPath_, std::ios::trunc);
+    if (!ofs.is_open()) return;
+    for (const auto& l : lines) ofs << l << '\n';
 }
 
 }  // namespace radar26

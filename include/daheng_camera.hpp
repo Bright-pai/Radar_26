@@ -31,6 +31,10 @@ public:
     bool Open(const DahengCameraOptions& options, std::string* error);
     // 读取一帧并输出为 BGR 图像。
     bool Read(cv::Mat* bgrFrame, std::string* error);
+    // 实时设置曝光时间（微秒）。
+    bool SetExposureTime(double exposureTimeUs, std::string* error = nullptr);
+    // 实时设置模拟增益。
+    bool SetGain(double gain, std::string* error = nullptr);
     // 关闭相机并释放底层资源。
     void Close();
     // 判断当前相机是否已经打开。

@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     }
 
     // 使用已加载的配置构造 RadarApp 实例，并初始化各子模块
-    radar26::RadarApp app(config);
+    radar26::RadarApp app(config, configPath);
     if (!app.Initialize(&error)) {
         std::cerr << "RadarApp initialize failed: " << error << std::endl;
         return 1;
@@ -89,3 +89,4 @@ int main(int argc, char** argv) {
     app.Run();
     return 0;
 }
+

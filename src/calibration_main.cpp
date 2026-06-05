@@ -353,6 +353,7 @@ bool ParseArgs(int argc, char** argv, CalibrationArgs* args, std::string* error)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg.empty()) continue;
         auto requireValue = [&](const std::string& name) -> const char* {
             if (i + 1 >= argc) {
                 if (error != nullptr) {
@@ -802,6 +803,8 @@ private:
                                     "清空全部层"});
         buttons_.push_back(UiButton{"quit", cv::Rect(x0 + 2 * (bw + gap), y0 + bh + gap, bw, bh),
                                     "不保存退出"});
+        buttons_.push_back(UiButton{"save_quit", cv::Rect(x0 + 3 * (bw + gap), y0 + bh + gap, bw, bh),
+                                    "保存并退出"});
     }
 
     std::string CurrentStepHint() const {
@@ -901,6 +904,14 @@ private:
             } else if (btn.id == "quit") {
                 UpdateStatus("已退出（未保存）");
                 exitRequested_ = true;
+            } else if (btn.id == "save_quit") {
+                std::string error;
+                if (SaveCalibration(&error)) {
+                    UpdateStatus("已保存并退出");
+                    exitRequested_ = true;
+                } else {
+                    UpdateStatus("保存失败: " + error + "（未退出）");
+                }
             }
             return true;
         }
@@ -1189,7 +1200,7 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    // load app config first (allow --config path)
+    // load app config first (allow --config path, strip from argv before ParseArgs)
     std::string configPath;
     bool userSpecifiedConfig = false;
     for (int i = 1; i < argc; ++i) {
@@ -1197,6 +1208,8 @@ int main(int argc, char** argv) {
         if (arg == "--config" && i + 1 < argc) {
             configPath = argv[++i];
             userSpecifiedConfig = true;
+            argv[i - 1][0] = '\0';  // 清除 --config
+            argv[i][0] = '\0';      // 清除路径参数
             continue;
         }
     }
@@ -1236,6 +1249,15 @@ int main(int argc, char** argv) {
         std::cerr << "Argument parse failed: " << error << std::endl;
         PrintHelp();
         return 1;
+    }
+
+    // 将相对路径的 NPY 输出转为绝对路径（基于配置文件所在目录）
+    {
+        const std::filesystem::path configDir = std::filesystem::path(configPath).parent_path();
+        std::filesystem::path npyPath(args.outputNpyPath);
+        if (npyPath.is_relative()) {
+            args.outputNpyPath = std::filesystem::absolute(configDir / npyPath).string();
+        }
     }
 
     std::cout << "标定工具参数:" << std::endl;

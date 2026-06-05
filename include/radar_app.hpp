@@ -26,7 +26,7 @@ namespace radar26 {
 // RadarApp 负责把相机、推理、目标滤波和串口通信串成完整闭环。
 class RadarApp {
 public:
-    explicit RadarApp(AppConfig config);
+    explicit RadarApp(AppConfig config, std::string configPath);
     ~RadarApp();
 
     // 读取标定数据、加载模型并初始化串口和内部状态。
@@ -48,9 +48,6 @@ private:
     // 解析接收队列中的数据包，并更新内部状态。
     void ParserWorker();
 
-    // 异步帧读取线程
-    void FrameGrabLoop();
-
     // 把地图坐标映射为串口协议所需坐标。
     std::pair<int, int> MapToSerCoords(const std::string& name, float mapX, float mapY) const;
     // 使用单应矩阵将图像点投影到地图坐标。
@@ -58,14 +55,11 @@ private:
 
     // 更新发送/接收状态文本，供监视窗口展示。
     void UpdateSerialStatus(SerialStatus* status, uint8_t seq, const std::string& text);
-    // 根据解析后的包更新雷达信息位。
-    bool UpdateRadarInfoFromParsedPacket(const ParsedPacket& parsed);
-
     // 建立 TCP 连接并发送 0x00 握手。
     bool OpenTcp(std::string* error);
     // TCP 发送线程：周期性检查触发条件并发送 0x01。
     void TcpSendLoop();
-    // 启动 / 停止 TCP Client 接收线程（连接 192.168.12.99:8001~8004）。
+    // 启动 / 停止 TCP Client 接收线程（连接 192.168.12.99:8001~8003）。
     void StartTcpReceivers();
     void StopTcpReceivers();
     // 单端口 TCP Client 读取线程：connect → recv 解帧 → 回调 → 断线重连。
@@ -76,7 +70,16 @@ private:
     void OnTcpKeyFrame(int level, const std::vector<uint8_t>& frame);
 
     AppConfig config_;
+    std::string configPath_;
     CalibrationData calibration_;
+
+    // 相机参数实时调节（曝光 + 增益），grabThread 轮询后应用到相机硬件
+    std::atomic<double> targetExposure_{0.0};
+    std::atomic<double> targetGain_{0.0};
+    double lastSavedExposure_ = -1.0;
+    double lastSavedGain_ = -1.0;
+
+    void SaveCameraParams() const;
 
     TrtYoloDetector carDetector_;
     TrtYoloDetector armorDetector_;
@@ -91,7 +94,6 @@ private:
     std::thread tcpRxThread8001_;              // TCP Client 接收 8001
     std::thread tcpRxThread8002_;              // TCP Client 接收 8002
     std::thread tcpRxThread8003_;              // TCP Client 接收 8003
-    std::thread tcpRxThread8004_;              // TCP Client 接收 8004
     std::thread grabThread_;
     std::atomic<bool> running_{false};
 
@@ -108,8 +110,6 @@ private:
     std::array<std::atomic<int>, 12> latestSerCoordY_{};
     std::array<std::atomic<bool>, 12> latestSerCoordValid_{};
     std::array<std::atomic<bool>, 12> latestSerCoordFromDetection_{};  // true=检测到, false=盲区猜测
-    std::array<std::string, 12> latestDetectedType_{};
-
     // 各个收发通道的统计信息，监控窗口直接显示这些内容。
     SerialStatus tx0305_{};   // 发送：位置坐标
     SerialStatus tx0121_{};   // 发送：雷达命令
@@ -118,18 +118,22 @@ private:
     SerialStatus rx0301_{};   // 接收：机器人交互位置
     SerialStatus rx0001_{};   // 接收：比赛状态（阶段+剩余时间）
     SerialStatus rx0003_{};   // 接收：前哨站血量
+    SerialStatus rx0101_{};   // 接收：能量机关状态
     SerialStatus tcp01_{};     // 发送：TCP 0x01 触发信号
     SerialStatus tcpRx8001_{}; // 接收：TCP 8001（0x0A01/0201/0202等）
     SerialStatus tcpRx8002_{}; // 接收：TCP 8002（0x0A06 L1密钥）
+
+    // TCP 8001 状态持久行：不被不同 cmdId 相互覆盖
+    std::string tcp8001PosLine_;   // 0x0A01 机器人位置
+    std::string tcp8001DataLine_;  // 0x0A02~0A05 66字节
+    void UpdateTcp8001Status(uint8_t seq);  // 合并两行写入 tcpRx8001_
     SerialStatus tcpRx8003_{}; // 接收：TCP 8003（0x0A06 L2密钥）
-    SerialStatus tcpRx8004_{}; // 接收：TCP 8004（0x0A06 L3密钥）
 
     std::atomic<int> doubleVulnerabilityChance_{-1};
     std::atomic<int> opponentDoubleTriggered_{-1};
     std::atomic<int> encryptLevel_{1};
     std::atomic<int> keyModifiable_{0};
     std::atomic<bool> hasRadarInfo020E_{false};
-    std::atomic<bool> canTriggerDoubleNow_{false};
     std::atomic<uint32_t> doubleTriggerEpoch_{0};
     uint32_t lastHandled020EEpoch_ = 0;  // 用于检测新的 0x020E 到达
 
@@ -137,7 +141,9 @@ private:
     bool initialKeySent_ = false;
     std::chrono::steady_clock::time_point lastCrackedSendTime_;
     std::chrono::steady_clock::time_point lastTcpFwdTime_;   // TCP 数据转发 1Hz 限速
-    uint8_t doubleTriggerCount_ = 0;   // 双倍易伤累计次数，pwdCmd=0 用
+    std::chrono::steady_clock::time_point lastDoubleSendTime_{}; // 双倍发送间隔≥60s
+    bool doubleTriggered330_ = false;   // remain<330s 已触发过
+    bool doubleTriggered180_ = false;   // remain<180s 已触发过
     uint8_t keyModCount_ = 0;          // 修改密钥累计次数，pwdCmd=1 用
     uint8_t crackedKeyCount_ = 0;      // 破解密钥累计次数，pwdCmd=2 用
 
@@ -149,6 +155,9 @@ private:
     std::atomic<uint16_t> latestStageRemainTime_{0};
     std::atomic<uint16_t> latestOutpostHealth_{1500};
     std::atomic<bool> outpostHealthDecreased_{false};  // 血量较上一时刻下降过
+    // 0x0101 能量机关状态
+    std::atomic<int> smallEnergyActivated_{0};  // 小能量机关 0=未激活 1=激活
+    std::atomic<int> bigEnergyActivated_{0};    // 大能量机关 0=未激活 1=激活
     // 一次性触发标记：保证每个触发条件只生效一次
     std::atomic<bool> tcpTrigger1Fired_{false};  // game_type==4 && time<=450 && 前哨站掉血
     std::atomic<bool> tcpTrigger2Fired_{false};  // 工程机器人到位（仅检测时）
@@ -162,9 +171,9 @@ private:
     std::array<uint8_t, 66> tcp0206Data_{};
     std::atomic<bool> tcp0206SegValid_[4];   // 0=0A02 1=0A03 2=0A04 3=0A05
     std::atomic<bool> tcp0206AllValid_{false};
-    // 0x0A06：三级破解密钥（8002→L1, 8003→L2, 8004→L3）
-    std::array<uint8_t, 6> tcpCrackedKey_[3];
-    std::atomic<bool> tcpCrackedKeyValid_[3];
+    // 0x0A06：破解密钥（8002→L1, 8003→L2）
+    std::array<uint8_t, 6> tcpCrackedKey_[2];
+    std::atomic<bool> tcpCrackedKeyValid_[2];
 
     // 帧缓冲区（异步读取）
     cv::Mat latestFrame_;

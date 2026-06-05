@@ -413,6 +413,44 @@ void DahengCamera::Close() {
     impl_->opened = false;
 }
 
+bool DahengCamera::SetExposureTime(double exposureTimeUs, std::string* error) {
+#if RADAR26_WITH_DAHENG
+    if (impl_->device == nullptr) {
+        if (error) *error = "camera not opened";
+        return false;
+    }
+    GX_STATUS status = GXSetFloatValue(impl_->device, "ExposureTime", exposureTimeUs);
+    if (status != GX_STATUS_SUCCESS) {
+        if (error) *error = "set ExposureTime failed: " + GxErrorText(status);
+        return false;
+    }
+    return true;
+#else
+    (void)exposureTimeUs;
+    if (error) *error = "daheng support not compiled";
+    return false;
+#endif
+}
+
+bool DahengCamera::SetGain(double gain, std::string* error) {
+#if RADAR26_WITH_DAHENG
+    if (impl_->device == nullptr) {
+        if (error) *error = "camera not opened";
+        return false;
+    }
+    GX_STATUS status = GXSetFloatValue(impl_->device, "Gain", gain);
+    if (status != GX_STATUS_SUCCESS) {
+        if (error) *error = "set Gain failed: " + GxErrorText(status);
+        return false;
+    }
+    return true;
+#else
+    (void)gain;
+    if (error) *error = "daheng support not compiled";
+    return false;
+#endif
+}
+
 /**
  * @brief 查询相机是否处于打开状态。
  *

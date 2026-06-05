@@ -57,11 +57,9 @@ std::string ResolvePath(const std::filesystem::path& baseDir, const std::string&
     }
     const std::filesystem::path p(rawPath);
     if (p.is_absolute()) {
-        // 绝对路径：仅做词法规范化（消除 ".." 和 "."）
-        return p.lexically_normal().string();
+        return std::filesystem::absolute(p).string();
     }
-    // 相对路径：以配置文件目录为基准拼接
-    return (baseDir / p).lexically_normal().string();
+    return std::filesystem::absolute(baseDir / p).string();
 }
 
 /**
